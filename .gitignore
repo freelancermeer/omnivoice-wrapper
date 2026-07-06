@@ -1,0 +1,47 @@
+# ── Big / machine-specific things that must NOT go to GitHub ──────────────
+
+# Python virtual environment (recreate on each PC — see README)
+venv/
+env/
+.venv/
+
+# Model weights (~3.3 GB — download separately, see README)
+Model/
+
+# Generated output voices + zips
+outputs/
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+build/
+dist/
+
+# ── Local editor / tooling config ─────────────────────────────────────────
+.claude/
+.vscode/
+.idea/
+*.code-workspace
+
+# ── Secrets / env ─────────────────────────────────────────────────────────
+.env
+.env.*
+*.key
+
+# ── Logs & temp ───────────────────────────────────────────────────────────
+*.log
+*.tmp
+tmp/
+scratch/
+
+# ── OS junk ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── Audio artifacts anywhere in the tree (keep repo clean) ────────────────
+*.wav
+*.zip
