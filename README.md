@@ -84,6 +84,22 @@ This is a **local app** — no cloud, no session limits. Everything runs on your
 the models are local, and the `.bat` files set `HF_HUB_OFFLINE=1`. Only
 `run_share.bat` (public link) needs internet.
 
+### 🔌 Local REST API
+The app also exposes a **REST API** on port **8001** (same process, shared model &
+queue) so any device/script can generate audio programmatically. Full spec +
+examples in **[LOCAL_API.md](LOCAL_API.md)**; interactive docs at
+`http://<pc-ip>:8001/api/docs`.
+
+```bash
+# text + voice clip -> mp3
+curl -X POST http://<pc-ip>:8001/api/tts \
+  -F "text=Hello from the API" -F "voice=@my_voice.wav" -F "format=mp3" -o out.mp3
+```
+Endpoints: `POST /api/tts` (sync), `POST /api/tts/async` + `GET /api/jobs/{id}`,
+`POST /api/voices` / `GET /api/voices` / `DELETE /api/voices/{id}` (voice library),
+`GET /api/health`.
+Disable with `OMNIVOICE_API=0`; secure with `OMNIVOICE_API_KEY=<key>`.
+
 ---
 
 ## Using the app (single page)
@@ -134,7 +150,10 @@ the models are local, and the `.bat` files set `HF_HUB_OFFLINE=1`. Only
 | `GRADIO_SERVER_NAME` | `0.0.0.0` | bind address (`127.0.0.1` = local only) |
 | `GRADIO_SERVER_PORT` | `7860` | port (auto-tries next if busy) |
 | `GRADIO_SHARE` | `0` | `1` = public gradio.live link |
-| `OMNIVOICE_AUTH` | _(unset)_ | `user:pass` to require login |
+| `OMNIVOICE_AUTH` | _(unset)_ | `user:pass` to require UI login |
+| `OMNIVOICE_API` | `1` | run the REST API (`0` to disable) |
+| `OMNIVOICE_API_PORT` | `8001` | REST API port |
+| `OMNIVOICE_API_KEY` | _(unset)_ | require `X-API-Key` header on the API |
 
 ---
 

@@ -36,9 +36,11 @@ Environment variables:
 
 import datetime
 import html as html_mod
+import json
 import logging
 import os
 import queue as queue_mod
+import shutil
 import socket
 import re
 import sys
@@ -769,18 +771,190 @@ def _get_or_build_prompt(ref_audio, ref_text):
     return prompt, used
 
 
+# ---------------------------------------------------------------------------
+# Voice library — save a clone under a name, reuse it later (UI + API share it).
+# Clips are stored in voices/, an index.json survives restarts. Prompts are
+# built lazily (transcribe/encode once) and cached.
+# ---------------------------------------------------------------------------
+VOICES_DIR = os.path.join(_HERE, "voices")
+os.makedirs(VOICES_DIR, exist_ok=True)
+VOICES_INDEX = os.path.join(VOICES_DIR, "index.json")
+VOICES = {}  # name -> {"path": wav, "ref_text": str, "prompt": VoiceClonePrompt|None}
+VOICES_LOCK = threading.Lock()
+NO_SAVED_VOICE = "— none —"
+
+
+def _save_voice_index():
+    with VOICES_LOCK:
+        data = {n: {"path": v["path"], "ref_text": v.get("ref_text", "")}
+                for n, v in VOICES.items()}
+    try:
+        with open(VOICES_INDEX, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not write voices index: %s", e)
+
+
+def _load_voice_index():
+    if not os.path.exists(VOICES_INDEX):
+        return
+    try:
+        with open(VOICES_INDEX, encoding="utf-8") as f:
+            data = json.load(f)
+        for name, meta in data.items():
+            p = meta.get("path")
+            if p and os.path.exists(p):
+                VOICES[name] = {"path": p, "ref_text": meta.get("ref_text", ""),
+                                "prompt": None}
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not load voices index: %s", e)
+
+
+def _unique_voice_name(base):
+    """Never overwrite an existing voice — return a fresh unique name."""
+    base = _safe_name(base)
+    with VOICES_LOCK:
+        existing = set(VOICES.keys())
+    if base not in existing:
+        return base
+    i = 2
+    while f"{base}_{i}" in existing:
+        i += 1
+    return f"{base}_{i}"
+
+
+def save_voice(name, audio_path, ref_text=None):
+    """Save the current clip under a UNIQUE name (trimmed to <=MAX_REF_SEC).
+    Returns (voice_name, transcript). Never overwrites an existing voice."""
+    if not audio_path:
+        raise ValueError("no audio to save")
+    name = _unique_voice_name(name)
+    ref_path, _dur, _trim = trim_reference(audio_path)  # cut at MAX_REF_SEC (10s)
+    dst = os.path.join(VOICES_DIR, name + ".wav")
+    try:
+        shutil.copyfile(ref_path, dst)
+    except Exception:
+        dst = ref_path  # fall back to the (temp) trimmed file
+    prompt, ref_used = _build_prompt(dst, ref_text)
+    with VOICES_LOCK:
+        VOICES[name] = {"path": dst, "ref_text": ref_used, "prompt": prompt}
+    _save_voice_index()
+    return name, ref_used
+
+
+def get_voice_prompt(name):
+    """Return (prompt, transcript) for a saved voice, building it on first use."""
+    with VOICES_LOCK:
+        v = VOICES.get(name)
+    if not v:
+        return None, ""
+    if v.get("prompt") is None:
+        prompt, ref_used = _build_prompt(v["path"], v.get("ref_text") or None)
+        with VOICES_LOCK:
+            v["prompt"] = prompt
+            v["ref_text"] = ref_used
+    return v["prompt"], v.get("ref_text", "")
+
+
+def list_voice_names():
+    with VOICES_LOCK:
+        return sorted(VOICES.keys())
+
+
+def delete_voice(name):
+    """Remove a saved voice (its clip + index entry). Returns True if deleted."""
+    with VOICES_LOCK:
+        v = VOICES.pop(name, None)
+    if not v:
+        return False
+    try:
+        p = v.get("path")
+        if p and os.path.exists(p) and os.path.normpath(
+                os.path.dirname(p)) == os.path.normpath(VOICES_DIR):
+            os.remove(p)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not delete voice clip: %s", e)
+    _save_voice_index()
+    return True
+
+
+def voice_details(name):
+    """Return (clip_path, transcript) for a saved voice, or (None, '')."""
+    with VOICES_LOCK:
+        v = VOICES.get(name)
+    if not v:
+        return None, ""
+    return v.get("path"), v.get("ref_text", "")
+
+
+_load_voice_index()
+
+
+def save_voice_ui(name, ref_audio):
+    """UI handler: save the uploaded clip to the permanent library."""
+    if not ref_audio:
+        return gr.update(), "⚠️ Upload a voice clip above first, then Save."
+    if not name or not name.strip():
+        return gr.update(), "⚠️ Type a name for the voice, then Save."
+    wanted = _safe_name(name)
+    try:
+        vid, ref_used = save_voice(name, ref_audio)
+    except Exception as e:  # noqa: BLE001
+        return gr.update(), f"❌ Save failed: {type(e).__name__}: {e}"
+    choices = [NO_SAVED_VOICE] + list_voice_names()
+    note = (f" (name '{wanted}' was taken)" if vid != wanted else "")
+    return (gr.update(choices=choices, value=vid),
+            f"💾 Your unique voice name is **{vid}**{note} — reusable from the "
+            "dropdown & API. It's saved permanently.")
+
+
+def refresh_voice_dropdown():
+    """Repopulate the saved-voice dropdown from the live library (runs on every
+    page load/refresh so newly-saved voices always show up)."""
+    return gr.update(choices=[NO_SAVED_VOICE] + list_voice_names())
+
+
+def on_pick_voice(name):
+    """When a saved voice is picked, load its sample clip + transcript into the
+    form so the user sees exactly what will be used."""
+    if not name or name == NO_SAVED_VOICE:
+        return None, "", ""
+    path, ref = voice_details(name)
+    if not path:
+        return None, "", f"⚠️ Voice '{name}' not found."
+    return (path, ref,
+            f"🎙️ Loaded **{name}** — its sample & transcript are shown above.")
+
+
+def delete_voice_ui(name):
+    """Delete the selected saved voice from the library."""
+    if not name or name == NO_SAVED_VOICE:
+        return gr.update(), None, "", "Pick a saved voice first, then Delete."
+    ok = delete_voice(name)
+    choices = [NO_SAVED_VOICE] + list_voice_names()
+    msg = (f"🗑️ Deleted voice **{name}**." if ok else f"Voice '{name}' not found.")
+    return gr.update(choices=choices, value=NO_SAVED_VOICE), None, "", msg
+
+
+def _resolve_ui_voice(saved_voice, ref_audio, ref_text):
+    """Prefer a saved-library voice; else the uploaded clip; else designed."""
+    if saved_voice and saved_voice != NO_SAVED_VOICE:
+        return get_voice_prompt(saved_voice)
+    if ref_audio:
+        return _get_or_build_prompt(ref_audio, ref_text)
+    return None, ""
+
+
 def add_job(project, script, ref_audio, ref_text, language, num_step,
             guidance_scale=2.0, denoise=True, speed=1.0, duration=None,
-            preprocess=True, postprocess=True):
+            preprocess=True, postprocess=True, saved_voice=None):
     global _JOB_SEQ
     if not script or not script.strip():
         return _ui_state("⚠️ Script is empty — nothing added.")
-    prebuilt, ref_used = None, ""
-    if ref_audio:
-        try:
-            prebuilt, ref_used = _get_or_build_prompt(ref_audio, ref_text)
-        except Exception as e:
-            return _ui_state(f"❌ Voice prompt failed: {type(e).__name__}: {e}")
+    try:
+        prebuilt, ref_used = _resolve_ui_voice(saved_voice, ref_audio, ref_text)
+    except Exception as e:
+        return _ui_state(f"❌ Voice prompt failed: {type(e).__name__}: {e}")
     with JOBS_LOCK:
         _JOB_SEQ += 1
         jid = _JOB_SEQ
@@ -873,7 +1047,7 @@ def clear_rows():
 
 def add_table(rows, ref_audio, ref_text, language, num_step,
               guidance_scale=2.0, denoise=True, speed=1.0, duration=None,
-              preprocess=True, postprocess=True):
+              preprocess=True, postprocess=True, saved_voice=None):
     """Queue one project per table row (columns: Project name, Script).
 
     All rows share the same (cached) voice. Empty-script rows are skipped.
@@ -893,12 +1067,10 @@ def add_table(rows, ref_audio, ref_text, language, num_step,
     if not items:
         return _ui_state("⚠️ Fill at least one row with a script.")
 
-    prebuilt, ref_used = None, ""
-    if ref_audio:
-        try:
-            prebuilt, ref_used = _get_or_build_prompt(ref_audio, ref_text)
-        except Exception as e:
-            return _ui_state(f"❌ Voice prompt failed: {type(e).__name__}: {e}")
+    try:
+        prebuilt, ref_used = _resolve_ui_voice(saved_voice, ref_audio, ref_text)
+    except Exception as e:
+        return _ui_state(f"❌ Voice prompt failed: {type(e).__name__}: {e}")
 
     new_ids = []
     with JOBS_LOCK:
@@ -1036,10 +1208,23 @@ def build_ui() -> gr.Blocks:
             # ============ LEFT: create ============
             with gr.Column(scale=5):
                 gr.Markdown("### 1️⃣  Pick a voice")
+                with gr.Row():
+                    st_saved_voice = gr.Dropdown(
+                        label="🎙️ Use a saved voice", choices=[NO_SAVED_VOICE] +
+                        list_voice_names(), value=NO_SAVED_VOICE, scale=4,
+                        info="Pick a saved voice (loads its sample + transcript), "
+                        "or upload a new clip below.",
+                    )
+                    st_del_voice = gr.Button("🗑️ Delete", scale=1)
                 st_ref = gr.Audio(
                     label="Upload a 3–10s voice clip   ·   leave empty = AI voice",
                     type="filepath",
                 )
+                with gr.Row():
+                    st_voice_name = gr.Textbox(
+                        label="Save this voice as", placeholder="narrator_a", scale=2,
+                    )
+                    st_save_voice = gr.Button("💾 Save to library", scale=1)
                 with gr.Accordion("Voice transcript (auto · usually leave as is)",
                                   open=False):
                     st_ref_text = gr.Textbox(
@@ -1147,19 +1332,36 @@ def build_ui() -> gr.Blocks:
                 st_timer = gr.Timer(2.0)
 
         # Auto-transcribe the reference on upload (fills the transcript box).
+        # If the clip is a saved-library voice, reuse its transcript (no re-ASR).
         def _on_studio_ref(ref_audio):
+            if ref_audio:
+                with VOICES_LOCK:
+                    for nm, v in VOICES.items():
+                        if v.get("path") == ref_audio:
+                            return (v.get("ref_text", ""),
+                                    f"<span style='color:#888;font-size:0.85em'>"
+                                    f"Saved voice '{nm}' transcript.</span>")
             text, msg = transcribe_reference(ref_audio)
             return text, f"<span style='color:#888;font-size:0.85em'>{msg}</span>"
 
         st_ref.change(_on_studio_ref, inputs=[st_ref],
                       outputs=[st_ref_text, st_msg])
 
+        # Pick a saved voice -> load its sample clip + transcript into the form.
+        st_saved_voice.change(on_pick_voice, inputs=[st_saved_voice],
+                              outputs=[st_ref, st_ref_text, st_msg])
+        st_del_voice.click(delete_voice_ui, inputs=[st_saved_voice],
+                           outputs=[st_saved_voice, st_ref, st_ref_text, st_msg])
+
+        st_save_voice.click(save_voice_ui, inputs=[st_voice_name, st_ref],
+                            outputs=[st_saved_voice, st_msg])
+
         _OUT = [st_board, st_files, st_picker, st_msg]
         st_add.click(
             add_job,
             inputs=[st_project, st_script, st_ref, st_ref_text, st_lang, st_steps,
                     st_cfg, st_denoise, st_speed, st_duration, st_preprocess,
-                    st_postprocess],
+                    st_postprocess, st_saved_voice],
             outputs=_OUT,
         ).then(lambda: ("", ""), outputs=[st_project, st_script])
 
@@ -1169,7 +1371,8 @@ def build_ui() -> gr.Blocks:
         st_addtable.click(
             add_table,
             inputs=[st_table_in, st_ref, st_ref_text, st_lang, st_steps, st_cfg,
-                    st_denoise, st_speed, st_duration, st_preprocess, st_postprocess],
+                    st_denoise, st_speed, st_duration, st_preprocess, st_postprocess,
+                    st_saved_voice],
             outputs=_OUT, api_name="add_table",
         ).then(clear_rows, outputs=[st_table_in])
 
@@ -1185,6 +1388,10 @@ def build_ui() -> gr.Blocks:
             inputs=[st_picker],
             outputs=[st_board, st_files, st_picker],
         )
+
+        # On every page load/refresh, repopulate the saved-voice dropdown from
+        # the live library (so voices saved after startup always appear).
+        demo.load(refresh_voice_dropdown, outputs=[st_saved_voice])
 
     return demo
 
@@ -1237,6 +1444,227 @@ _CSS = """
 @keyframes vqpulse {0%,100%{opacity:1;} 50%{opacity:0.45;}}
 """
 
+
+# ===========================================================================
+# Local REST API  (see LOCAL_API.md)
+# Runs in the SAME process as the UI (shared model + GPU + queue) on its own
+# port, so any device on the LAN can POST text + a voice and get audio back.
+# ===========================================================================
+import io
+
+API_PORT = int(os.environ.get("OMNIVOICE_API_PORT", "8001"))
+
+
+def _encode_audio(wav_i16, sr, fmt="mp3"):
+    """int16 mono numpy -> (bytes, media_type, ext). mp3 needs ffmpeg (present)."""
+    fmt = (fmt or "mp3").lower()
+    if fmt == "wav":
+        buf = io.BytesIO()
+        sf.write(buf, wav_i16, sr, format="WAV", subtype="PCM_16")
+        return buf.getvalue(), "audio/wav", "wav"
+    from pydub import AudioSegment
+    seg = AudioSegment(wav_i16.tobytes(), frame_rate=int(sr), sample_width=2, channels=1)
+    buf = io.BytesIO()
+    seg.export(buf, format="mp3", bitrate=os.environ.get("OMNIVOICE_MP3_BITRATE", "192k"))
+    return buf.getvalue(), "audio/mpeg", "mp3"
+
+
+def _resolve_api_voice(voice_bytes, voice_filename, voice_id, ref_text):
+    """Return (prebuilt_prompt_or_None, ref_used, mode)."""
+    if voice_id:
+        prompt, ref_used = get_voice_prompt(voice_id)
+        if prompt is None:
+            raise KeyError(f"voice_id '{voice_id}' not found")
+        return prompt, ref_used, "clone"
+    if voice_bytes:
+        suffix = os.path.splitext(voice_filename or "ref.wav")[1] or ".wav"
+        fd, tmp = tempfile.mkstemp(suffix=suffix, prefix="api_ref_")
+        os.close(fd)
+        with open(tmp, "wb") as f:
+            f.write(voice_bytes)
+        prompt, ref_used = _get_or_build_prompt(tmp, ref_text)
+        return prompt, ref_used, "clone"
+    return None, "", "design"
+
+
+def _api_enqueue(project, script, prebuilt, ref_used, language, num_step, speed):
+    """Create a queued job (for the async API) and return its id."""
+    global _JOB_SEQ
+    with JOBS_LOCK:
+        _JOB_SEQ += 1
+        jid = _JOB_SEQ
+        JOBS.append({
+            "id": jid, "project": _safe_name(project), "status": "Queued",
+            "info": "", "file": None, "cancel": False, "ref_used": ref_used,
+            "params": {
+                "script": script, "ref_audio": None, "clone_prompt": prebuilt,
+                "ref_text": None, "language": language, "num_step": int(num_step),
+                "guidance_scale": 2.0, "denoise": True,
+                "speed": float(speed), "duration": None,
+                "preprocess": True, "postprocess": True,
+            },
+        })
+    JOB_Q.put(jid)
+    return jid
+
+
+def _build_api():
+    from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
+    from fastapi.responses import Response, JSONResponse
+
+    api = FastAPI(title="OmniVoice Local API", version="1.0",
+                  docs_url="/api/docs", openapi_url="/api/openapi.json")
+
+    def _auth(x_api_key):
+        key = os.environ.get("OMNIVOICE_API_KEY", "").strip()
+        if key and (x_api_key or "") != key:
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    @api.get("/api/health")
+    def health():
+        with JOBS_LOCK:
+            q = sum(1 for j in JOBS if j["status"] == "Queued")
+            p = sum(1 for j in JOBS if j["status"] == "Processing")
+        return {"status": "ok", "model": "OmniVoice", "device": device_map,
+                "sampling_rate": sampling_rate, "queue": {"queued": q, "processing": p},
+                "voices": list(VOICES.keys())}
+
+    @api.post("/api/voices")
+    def register_voice(name: str = Form(...), voice: UploadFile = File(...),
+                       ref_text: str = Form(None), x_api_key: str = Header(None)):
+        _auth(x_api_key)
+        data = voice.file.read()
+        suffix = os.path.splitext(voice.filename or "ref.wav")[1] or ".wav"
+        fd, tmp = tempfile.mkstemp(suffix=suffix, prefix="api_voice_")
+        os.close(fd)
+        with open(tmp, "wb") as f:
+            f.write(data)
+        vid, ref_used = save_voice(name, tmp, ref_text)
+        return {"voice_id": vid, "ref_text": ref_used}
+
+    @api.get("/api/voices")
+    def list_voices():
+        with VOICES_LOCK:
+            return {"voices": [{"voice_id": k, "ref_text": v["ref_text"]}
+                               for k, v in VOICES.items()]}
+
+    @api.delete("/api/voices/{voice_id}")
+    def delete_voice_api(voice_id: str, x_api_key: str = Header(None)):
+        _auth(x_api_key)
+        if not delete_voice(voice_id):
+            raise HTTPException(status_code=404, detail="voice not found")
+        return {"deleted": voice_id}
+
+    def _synthesize(text, language, steps, speed, prebuilt, mode):
+        out, status = _gen_core(
+            text, (None if not language or language == "Auto" else language),
+            None, None, int(steps), 2.0, True, float(speed), None, True, True,
+            mode=mode, ref_text=None, prebuilt_prompt=prebuilt)
+        if out is None:
+            raise HTTPException(status_code=500, detail=status)
+        sr, wav = out
+        return sr, wav, status
+
+    @api.post("/api/tts")
+    def tts(text: str = Form(...), voice: UploadFile = File(None),
+            voice_id: str = Form(None), ref_text: str = Form(None),
+            language: str = Form("Auto"), format: str = Form("mp3"),
+            steps: int = Form(16), speed: float = Form(1.0),
+            project: str = Form("tts"), json: int = 0, x_api_key: str = Header(None)):
+        _auth(x_api_key)
+        if not text or not text.strip():
+            raise HTTPException(status_code=400, detail="text is required")
+        vbytes = voice.file.read() if voice is not None else None
+        try:
+            prebuilt, ref_used, mode = _resolve_api_voice(
+                vbytes, getattr(voice, "filename", None), voice_id, ref_text)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        sr, wav, status = _synthesize(text.strip(), language, steps, speed, prebuilt, mode)
+        audio, media, ext = _encode_audio(wav, sr, format)
+        info = status.replace("Done. ", "").strip("() ")
+        dur = len(wav) / sr if sr else 0.0
+        headers = {"X-RTF": info.split("RTF")[-1].strip() if "RTF" in info else "",
+                   "X-Duration-Sec": f"{dur:.2f}",
+                   "Content-Disposition": f'attachment; filename="{_safe_name(project)}.{ext}"'}
+        if json:
+            fname = f"{_safe_name(project)}.{ext}"
+            with open(os.path.join(_OUT_DIR, fname), "wb") as f:
+                f.write(audio)
+            return JSONResponse({"ok": True, "project": _safe_name(project),
+                                 "file": fname, "download_url": f"/api/files/{fname}",
+                                 "duration_sec": round(dur, 2), "info": info,
+                                 "voice": "cloned" if prebuilt else "designed",
+                                 "ref_text": ref_used})
+        return Response(content=audio, media_type=media, headers=headers)
+
+    @api.post("/api/tts/async")
+    def tts_async(text: str = Form(...), voice: UploadFile = File(None),
+                  voice_id: str = Form(None), ref_text: str = Form(None),
+                  language: str = Form("Auto"), steps: int = Form(16),
+                  speed: float = Form(1.0), project: str = Form("tts"),
+                  x_api_key: str = Header(None)):
+        _auth(x_api_key)
+        if not text or not text.strip():
+            raise HTTPException(status_code=400, detail="text is required")
+        vbytes = voice.file.read() if voice is not None else None
+        try:
+            prebuilt, ref_used, _ = _resolve_api_voice(
+                vbytes, getattr(voice, "filename", None), voice_id, ref_text)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        jid = _api_enqueue(project, text.strip(), prebuilt, ref_used,
+                           language, steps, speed)
+        return {"job_id": jid, "project": _safe_name(project), "status": "queued"}
+
+    def _job_public(j):
+        return {"job_id": j["id"], "project": j["project"],
+                "status": j["status"].lower().rstrip("…"),
+                "info": j["info"],
+                "download_url": (f"/api/jobs/{j['id']}/download" if j["file"] else None)}
+
+    @api.get("/api/jobs/{jid}")
+    def job_status(jid: int):
+        with JOBS_LOCK:
+            j = _find_job(jid)
+            if not j:
+                raise HTTPException(status_code=404, detail="job not found")
+            return _job_public(j)
+
+    @api.get("/api/jobs/{jid}/download")
+    def job_download(jid: int, format: str = "mp3"):
+        with JOBS_LOCK:
+            j = _find_job(jid)
+            if not j:
+                raise HTTPException(status_code=404, detail="job not found")
+            path, proj = j["file"], j["project"]
+        if not path or not os.path.exists(path):
+            raise HTTPException(status_code=409, detail="not ready")
+        wav, sr = sf.read(path, dtype="int16")
+        audio, media, ext = _encode_audio(wav, sr, format)
+        return Response(content=audio, media_type=media, headers={
+            "Content-Disposition": f'attachment; filename="{proj}.{ext}"'})
+
+    @api.get("/api/files/{name}")
+    def get_file(name: str):
+        from fastapi.responses import FileResponse
+        safe = os.path.basename(name)
+        path = os.path.join(_OUT_DIR, safe)
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="file not found")
+        return FileResponse(path, filename=safe)
+
+    return api
+
+
+def _start_api_server():
+    try:
+        import uvicorn
+        uvicorn.run(_build_api(), host="0.0.0.0", port=API_PORT, log_level="warning")
+    except Exception as e:  # noqa: BLE001
+        log.warning("API server failed to start: %s", e)
+
+
 def _lan_ips():
     ips = set()
     try:
@@ -1269,19 +1697,27 @@ if __name__ == "__main__":
     if auth:
         print(f"Login required: user '{auth[0]}'")
 
+    # Start the REST API (same process, own port) unless disabled.
+    if os.environ.get("OMNIVOICE_API", "1") == "1":
+        threading.Thread(target=_start_api_server, daemon=True).start()
+
     app = demo.queue()
     # Auto-fallback: if the port is busy, try the next few ports.
     last_err = None
     for port in range(start_port, start_port + 11):
         try:
-            print("=" * 56)
-            print(f"  Local:    http://127.0.0.1:{port}")
-            if server_name == "0.0.0.0":
-                for ip in _lan_ips():
-                    print(f"  Network:  http://{ip}:{port}   <- share on LAN")
-            else:
-                print("  (LAN sharing off — run run_lan.bat for network access)")
-            print("=" * 56)
+            _ips = _lan_ips() if server_name == "0.0.0.0" else []
+            _api_on = os.environ.get("OMNIVOICE_API", "1") == "1"
+            print("=" * 60)
+            print(f"  UI    (local):   http://127.0.0.1:{port}")
+            for ip in _ips:
+                print(f"  UI    (LAN):     http://{ip}:{port}")
+            if _api_on:
+                print(f"  API   (local):   http://127.0.0.1:{API_PORT}/api")
+                for ip in _ips:
+                    print(f"  API   (LAN):     http://{ip}:{API_PORT}/api")
+                print(f"  API   docs:      http://127.0.0.1:{API_PORT}/api/docs")
+            print("=" * 60)
             app.launch(
                 server_name=server_name,
                 server_port=port,

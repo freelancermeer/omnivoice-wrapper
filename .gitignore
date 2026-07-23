@@ -11,6 +11,9 @@ Model/
 # Generated output voices + zips
 outputs/
 
+# Registered API voice clips
+voices/
+
 # ── Python ────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
