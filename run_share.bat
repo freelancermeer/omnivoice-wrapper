@@ -13,6 +13,7 @@ set HF_HUB_OFFLINE=1
 set TRANSFORMERS_OFFLINE=1
 set HF_HUB_DISABLE_SYMLINKS_WARNING=1
 set PYTHONUTF8=1
+set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 set GRADIO_SHARE=1
 set OMNIVOICE_OPEN_BROWSER=1
@@ -20,6 +21,8 @@ set OMNIVOICE_OPEN_BROWSER=1
 REM ---- Password (STRONGLY recommended for public links) ----
 REM Neeche wali line ka REM hata kar user:pass set karein:
 REM set OMNIVOICE_AUTH=admin:mypassword
+REM ---- API key bhi lagayein agar API bahar khul rahi hai ----
+REM set OMNIVOICE_API_KEY=change-me
 
 echo Starting with PUBLIC share link...
 echo Console me jo https://....gradio.live URL aaye wo share karein.

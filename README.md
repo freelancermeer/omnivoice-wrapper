@@ -1,10 +1,15 @@
 # 🎙️ OmniVoice Voiceover Studio
 
-A local, offline-first web app for [k2-fsa/OmniVoice](https://huggingface.co/k2-fsa/OmniVoice)
+A local, offline-first web app + REST API for [k2-fsa/OmniVoice](https://huggingface.co/k2-fsa/OmniVoice)
 — a massively multilingual (600+ languages) zero-shot TTS model with **voice
-cloning** and **voice design** (based on Qwen3-0.6B). Built with Gradio, it adds a
-production-style **project queue**: pick a voice, add scripts, and render them one
-at a time, with every clip auto-saved to a folder.
+cloning** and **voice design**. Built with Gradio, it adds a production-style
+**project queue**: pick a voice, add scripts, render them one at a time, every
+clip auto-saved to a folder.
+
+Every clip is **transcribed back and compared against your script** before it is
+returned, **levelled to the same loudness** as every other clip, and generated
+from a reference that was **cut at a natural pause rather than a stopwatch**.
+Those three things are why this exists rather than a bare `model.generate()`.
 
 > **Note:** the model weights (`Model/`, ~3.3 GB) and the Python `venv/` are **not**
 > in this repo (see `.gitignore`). Follow the setup below to get them on a new PC.
@@ -14,152 +19,268 @@ at a time, with every clip auto-saved to a folder.
 ## Requirements
 - **NVIDIA GPU** with CUDA 12.8 drivers (tested on RTX 3060 Ti 8 GB, FP16).
 - **Python 3.10 – 3.12** (developed on 3.12).
-- Windows (works on Linux too; adjust the `.bat` launchers to shell scripts).
+- Windows (works on Linux/macOS too; adjust the `.bat` launchers to shell scripts).
 - ~5 GB disk for the models (OmniVoice ~3.3 GB + Whisper ~1.6 GB).
 
 ---
 
 ## Setup on a new PC
 
-### 1. Clone the repo
 ```powershell
 git clone https://github.com/<your-user>/<your-repo>.git omnivoice
 cd omnivoice
-```
-
-### 2. Create a virtual environment
-```powershell
 py -3.12 -m venv venv
-```
-
-### 3. Install PyTorch (CUDA 12.8) + dependencies
-```powershell
 venv\Scripts\python -m pip install --upgrade pip
 venv\Scripts\python -m pip install torch==2.8.0 torchaudio==2.8.0 --extra-index-url https://download.pytorch.org/whl/cu128
 venv\Scripts\python -m pip install -r requirements.txt
-```
-
-### 4. Get the TTS model (`Model/` folder — not in git)
-Download the OmniVoice weights into a local `Model/` folder:
-```powershell
 venv\Scripts\hf.exe download k2-fsa/OmniVoice --local-dir Model
-```
-The app auto-detects `./Model` and loads from it (fully offline afterwards).
-
-> If you skip this, the app still works — on first launch it auto-downloads the
-> model from HuggingFace into the HF cache (needs internet that one time).
-
-The **Whisper** ASR model (`openai/whisper-large-v3-turbo`, ~1.6 GB, used to
-auto-transcribe reference clips) downloads automatically on first run. To
-pre-cache it: `venv\Scripts\hf.exe download openai/whisper-large-v3-turbo`.
-
-### 5. Run
-```powershell
 venv\Scripts\python app.py
 ```
-The browser opens automatically. The terminal prints:
+
+The app auto-detects `./Model` and loads from it (fully offline afterwards). If
+you skip step 4 it downloads from HuggingFace on first launch instead. The
+**Whisper** ASR model (`openai/whisper-large-v3-turbo`, ~1.6 GB) downloads
+automatically on first run — it transcribes reference clips *and* checks every
+generated clip against its script. Pre-cache it with
+`venv\Scripts\hf.exe download openai/whisper-large-v3-turbo`.
+
+The terminal prints:
+
 ```
-  Local:    http://127.0.0.1:7860
-  Network:  http://<your-ip>:7860   <- share on LAN
+  UI    (local):   http://127.0.0.1:7860
+  UI    (LAN):     http://<your-ip>:7860
+  API   (local):   http://127.0.0.1:8001/api
+  API   ready:     http://127.0.0.1:8001/api/ready   <- point monitoring here
 ```
 
 ---
 
 ## Running & sharing
-This is a **local app** — no cloud, no session limits. Everything runs on your PC.
 
 | Launcher | What it does |
 |----------|--------------|
-| **`run.bat`** (or Desktop shortcut) | Starts the app. Reachable at `127.0.0.1:7860` **and** on your LAN at `<pc-ip>:7860` (binds `0.0.0.0` by default). |
-| **`run_share.bat`** | Also creates a temporary **public** `https://xxxxx.gradio.live` link (needs internet; 72 h). |
+| **`run.bat`** | Starts the app on `127.0.0.1:7860` **and** the LAN (binds `0.0.0.0`). |
+| **`run_share.bat`** | Also creates a temporary public `https://xxxxx.gradio.live` link (72 h). |
+| **`run_tests.bat`** | Unit tests. **No GPU needed** — runs on any machine. |
 
-- **LAN:** others on the same Wi-Fi open `http://<your-ip>:7860`. If it doesn't
-  connect, allow the port in Windows Firewall (admin CMD):
+- **LAN:** others open `http://<your-ip>:7860`. If it doesn't connect, allow the
+  port in Windows Firewall (admin CMD):
   `netsh advfirewall firewall add rule name="OmniVoice" dir=in action=allow protocol=TCP localport=7860`
 - **Local only:** set `GRADIO_SERVER_NAME=127.0.0.1`.
-- **Password:** set `OMNIVOICE_AUTH=user:pass` before launching (recommended when sharing).
-- **Auto-start on login:** `Win+R` → `shell:startup` → drop a copy of the Desktop shortcut there.
+- **Password:** `OMNIVOICE_AUTH=user:pass` (do this before sharing publicly).
+- **Auto-start on login:** `Win+R` → `shell:startup` → drop a shortcut there.
 
-**Works fully offline:** Gradio serves its UI from the installed package (no CDN),
-the models are local, and the `.bat` files set `HF_HUB_OFFLINE=1`. Only
-`run_share.bat` (public link) needs internet.
-
-### 🔌 Local REST API
-The app also exposes a **REST API** on port **8001** (same process, shared model &
-queue) so any device/script can generate audio programmatically. Full spec +
-examples in **[LOCAL_API.md](LOCAL_API.md)**; interactive docs at
-`http://<pc-ip>:8001/api/docs`.
-
-```bash
-# text + voice clip -> mp3
-curl -X POST http://<pc-ip>:8001/api/tts \
-  -F "text=Hello from the API" -F "voice=@my_voice.wav" -F "format=mp3" -o out.mp3
-```
-Endpoints: `POST /api/tts` (sync), `POST /api/tts/async` + `GET /api/jobs/{id}`,
-`POST /api/voices` / `GET /api/voices` / `DELETE /api/voices/{id}` (voice library),
-`GET /api/health`.
-Disable with `OMNIVOICE_API=0`; secure with `OMNIVOICE_API_KEY=<key>`.
+**Works fully offline:** Gradio serves its UI from the installed package, the
+models are local, and the `.bat` files set `HF_HUB_OFFLINE=1`.
 
 ---
 
 ## Using the app (single page)
-1. **Pick a voice** — upload a 3–10 s clip (auto-trimmed + auto-transcribed by
-   Whisper). Leave empty for a designed/AI voice. The voice **stays loaded** and is
-   cached, so adding many scripts reuses it without re-cloning.
-2. **Add your script** — enter a Project name + Script → **Add to queue**. Or use
-   **🧩 Add several at once**: an editable table (Project name + Script per row),
-   **➕ Add row** for unlimited rows, then **Add all rows to queue** (same voice).
+
+1. **Pick a voice** — upload a 6–10 s clip. It is trimmed at a natural pause,
+   levelled, transcribed, and checked; you are told about anything wrong with it
+   *before* you generate ten hours of audio. See
+   **[docs/reference_playbook.md](docs/reference_playbook.md)**. Leave it empty
+   for a designed/AI voice.
+2. **Add your script** — Project name + Script → **Add to queue**. Or
+   **🧩 Add several at once**: a table of Project name + Script, one row per clip,
+   all using the same voice.
 3. **Settings (optional)** — language, quality steps (16 = fast, 32+ = better),
-   speed, guidance, duration, denoise, pre/post-process.
-4. **Render queue** (right) — jobs process **one at a time** with live status
-   (⏳ Queued → 🔊 Processing → ✅ Done / ❌ Error / 🚫 Cancelled), time · RTF, and
-   each card shows the exact voice transcript used. Select a project to
-   **Cancel / Remove**; plus **Cancel all queued** / **Clear finished**.
-5. **Save & downloads** — every render **auto-saves** to your chosen folder (no
-   clicking). Also **📦 Zip all completed** and per-file downloads.
-6. **🛑 Shut down PC when the queue finishes** — optional; shuts down ~60 s after
-   the last job (cancel with `shutdown /a`).
+   speed, guidance, duration.
+4. **Render queue** — jobs process one at a time with live status, time · RTF ·
+   wpm, the exact voice transcript used, and **any warning about what came out**
+   (words dropped, a leaked tail removed, loudness that could not be reached).
+5. **Save & downloads** — every render auto-saves; plus **📦 Zip all completed**.
+6. **🛑 Shut down PC when the queue finishes** — optional.
 
 ---
 
-## Built-in fixes for known OmniVoice issues (in [`app.py`](app.py))
-| Issue | Fix |
-|-------|-----|
-| Long reference audio degrades quality (#50) — trained on 3–10 s clips | Reference auto-trimmed to `OMNIVOICE_MAX_REF_SEC` (default **10 s**). Warns if < 3 s. |
-| `"123"` garbled | `num2words` front-end, language-aware (en/fr/es/de/ru/pt/it/ja/ko/ar/…); non-Latin left untouched. |
-| Phone / long digit runs wrong | Runs ≥ 7 digits read **digit by digit**; decimals → "three point one four". |
-| Slow on consumer GPUs | FP16, **steps default 16**, TF32 on; status shows time + **RTF** (<1 = faster than realtime). |
-| Long text → non-speech "scratching" (#144) | Split on sentences into ~`OMNIVOICE_MAX_CHARS` (100) chunks, rendered separately + concatenated. |
-| Voice drifts between chunks (#44) | One cached `VoiceClonePrompt` reused across all chunks/scripts; design mode locks voice from the first chunk. |
-| Reference transcript needed | Leave it empty → multilingual Whisper (`whisper-large-v3-turbo`) auto-transcribes. |
+## 🔌 Local REST API
+
+Port **8001**, same process, shared model and queue. Full spec in
+**[LOCAL_API.md](LOCAL_API.md)**; interactive docs at `http://<pc-ip>:8001/api/docs`.
+
+```bash
+# text + voice clip -> mp3   (this contract is frozen and will not change)
+curl -X POST http://<pc-ip>:8001/api/tts \
+  -F "text=Hello from the API" -F "voice=@my_voice.wav" -F "format=mp3" -o out.mp3
+```
+
+`POST /api/tts` · `POST /api/v2/tts` (JSON + verifier metadata) ·
+`POST /api/tts/async` + `GET /api/jobs/{id}` · `POST /api/transcribe` ·
+voice library CRUD · `GET /api/live` · `GET /api/ready` · `GET /api/selftest` ·
+`GET /api/health` · `GET /api/metrics`.
+
+Disable with `OMNIVOICE_API=0`; secure with `OMNIVOICE_API_KEY=<key>`;
+per-customer isolation with `OMNIVOICE_API_KEYS=k1:acme,k2:globex`.
+
+---
+
+## What this wrapper fixes
+
+A production batch of **63 clips / 64.7 minutes / 10,269 words** was generated,
+transcribed back, and diffed word by word against the scripts that were sent.
+Each row below is a measured finding and where it is handled.
+
+| Finding | Fix |
+|---|---|
+| **218 words spoken that were never sent.** One voice contributed 185 (`forcing` ×163). Its reference was hard-cut at exactly 10.0 s — mid-word — and the model kept finishing that word at the end of 86–90% of its clips. | References never end mid-word ([`audio_fx.smart_trim_reference`](audio_fx.py)), whether **we** cut them there (cut at the last natural pause instead, preferring a shorter clip over a mid-word one) or **the customer** stopped recording mid-word (cut back to their last finished phrase). Then faded, given 0.3 s of trailing silence, and re-transcribed so text and audio always agree. What cannot be repaired is explained at upload. Anything that still leaks is caught by the verifier and trimmed. |
+| **12 words silently dropped**, mostly one arm of a repeated structure ("He called it perjury / fraud / **contempt**" lost the middle clause), with nothing reporting it. | Every chunk is transcribed back and **sequence-aligned** against the script ([`verify.word_diff`](verify.py)). A drop triggers a regeneration; what cannot be fixed is reported in `X-OmniVoice-Warning` and on the job card. |
+| **Loudness tracked the reference**: −0.2 dB (edge of clipping) to −12.6 dB in one video. | ITU-R BS.1770 loudness normalization to **−20 LUFS** with a **−1 dBTP** ceiling, on both the stored reference and every output. |
+| **CUDA OOM that never recovered**, while `/api/health` said `"ok"` and GPU utilisation read 5 %. | `inference_mode`, results moved to CPU immediately, explicit `del` → `gc.collect()` → `empty_cache()`, `expandable_segments:True`, bounded concurrency, OOM retry and optional model reload ([`gpu_guard.py`](gpu_guard.py)). |
+| **Health lied.** | `/api/ready` is backed by a **cached self-test that actually generates words**, and returns `503` when it fails. `/api/live` is the pure liveness probe. `/api/health` reports allocated **and** reserved VRAM, so fragmentation is visible. |
+| **Four concurrent callers killed the server.** | A semaphore (default 1 on 8 GB). Extra callers queue, then get `429` with `Retry-After`. |
+| **Stitched long-form output has an audible seam** — measured elsewhere at ~28 dB energy jumps and 67–69 Hz F0 jumps at chunk boundaries, and XTTS's per-chunk normalization makes volume jump between sentences. | `audio_fx.join_chunks`: even edges, a fixed inter-sentence gap, 15 ms edge fades, and level matching to the clip's **own median** (never to a fixed per-chunk target). |
+| **Silence stripping clips final consonants**, a documented way to lose the last word of a sentence. | A 10 dB stricter edge threshold on generated audio, and 300 ms of tail padding on every clip. |
+| **133–203 wpm across one batch**; short inputs rushed. | Balanced chunking, and wpm measured per clip and compared against **that voice's own baseline** — a metric, never a gate (a documentary narrator runs ~100 wpm; a fixed 140–180 band would fail every clip). |
+| Numbers, currency, em dashes, ordinals, acronyms. | A wrapper-owned text front-end ([`textnorm.py`](textnorm.py)), with the result returned in `X-OmniVoice-Normalized-Text` so it can be checked without listening. |
+| Retries after a client timeout paid for the same clip twice. | `Idempotency-Key` header; a replay returns the cached audio with `X-OmniVoice-Idempotent-Replay: true`. |
+| A typo in `voice_id` silently used a different voice. | **404, always.** Never a substitute. |
+
+Earlier fixes that are still in place: reference trimming for GitHub #50,
+sentence chunking for #144, one shared voice prompt across chunks for #44, FP16
++ TF32, steps default 16.
+
+**Verified not broken, do not "fix":** numbers, currency, percentages, decimals
+and ordinals were already correct in the measured batch; ordinary acronyms
+(`RFK` → "r f k", `CFO` → "c f o") are already right, so the lexicon only
+carries acronyms that must be read as *words* (MAGA, NASA).
+
+---
+
+## Getting the lowest RTF
+
+RTF (compute time ÷ audio duration) is the number this gets judged on. Where the
+time actually goes, and what each lever costs:
+
+| Lever | Effect | Cost |
+|---|---|---|
+| **Quality steps** | `16` is the default and the best value. `8–10` is noticeably faster | below ~10, quality starts to show |
+| **`OMNIVOICE_VERIFY_MODE=fast`** (default) | one ASR pass over the finished clip instead of one per chunk — a five-chunk job drops from 5 extra passes to **1** | drilling into chunks only happens when something is actually wrong |
+| `OMNIVOICE_VERIFY=0` | removes checking entirely | you go back to shipping bad clips silently — the thing this exists to prevent |
+| `OMNIVOICE_MAX_CHARS` | larger chunks = fewer seams and fewer per-call overheads | too large and long-text degeneration returns |
+| `OMNIVOICE_BATCH` | >1 batches chunks per GPU call | usually *raises* RTF: padding to the longest chunk wastes compute. Only for long, uniform chunks |
+| `OMNIVOICE_PREWARM_VOICES=1` | no embedding rebuild on the first request per voice after a restart | none |
+
+Measured on this machine, the CPU-side audio work is **not** where the time
+goes — on a 60 s clip: loudness normalization 126 ms, chunk joining 6 ms,
+about **0.2 % of realtime**. Do not tune those; tune steps and verification.
+
+Two things that lower RTF for free: longer scripts amortise the fixed per-call
+overhead, and warm voices skip the embedding build. A one-line clip will always
+show a worse RTF than a paragraph — that is arithmetic, not a fault.
+
+---
+
+## Testing
+
+```powershell
+venv\Scripts\python -m pytest tests -q          REM no GPU needed
+venv\Scripts\python tools\acceptance.py --voice narrator_a
+venv\Scripts\python tools\audit_batch.py manifest.json
+```
+
+- **`tests/`** — 58 unit tests for the text front-end, the audio repair and the
+  verifier. Pure Python: they run on a laptop with no CUDA and no weights, which
+  is where all three were developed.
+- **`tools/acceptance.py`** — run against a live server. Checks the frozen API
+  contract, unknown-voice handling, limits, idempotency, the ten text probes,
+  the reference-bleed probe, loudness consistency, seed behaviour, four-way
+  concurrency, and whether VRAM climbs across requests.
+- **`tools/audit_batch.py`** — the measurement that found these bugs, on your own
+  finished batch: transcribes every clip and reports words added, words dropped,
+  and which clips are responsible.
 
 ---
 
 ## Environment variables
+
+### Text
 | Var | Default | Purpose |
 |-----|---------|---------|
-| `OMNIVOICE_MODEL` | `./Model` if present, else `k2-fsa/OmniVoice` | model path or HF id |
-| `OMNIVOICE_ASR_MODEL` | `openai/whisper-large-v3-turbo` | Whisper ASR (local path ok) |
-| `OMNIVOICE_OUTPUT_DIR` | `./outputs` | where voices auto-save |
-| `OMNIVOICE_MAX_REF_SEC` | `10` | reference-audio trim threshold |
-| `OMNIVOICE_NORMALIZE` | `1` | number normalization on/off |
-| `OMNIVOICE_NUM_STEP` | _(unset)_ | force inference steps (e.g. `8` for speed) |
-| `OMNIVOICE_MAX_CHARS` | `100` | max characters per chunk |
+| `OMNIVOICE_NORMALIZE_LEVEL` | `full` | `full` / `basic` / `off` |
+| `OMNIVOICE_LEXICON` | `./lexicon.json` | pronunciation overrides |
+| `OMNIVOICE_YEARS` | `1` | read 1100–2099 as years ("twenty twenty-four") |
 | `OMNIVOICE_CHUNK` | `1` | sentence chunking for long text |
-| `OMNIVOICE_ATTN` | `sdpa` | attention backend (model doesn't support flash-attn) |
-| `GRADIO_SERVER_NAME` | `0.0.0.0` | bind address (`127.0.0.1` = local only) |
-| `GRADIO_SERVER_PORT` | `7860` | port (auto-tries next if busy) |
-| `GRADIO_SHARE` | `0` | `1` = public gradio.live link |
-| `OMNIVOICE_AUTH` | _(unset)_ | `user:pass` to require UI login |
-| `OMNIVOICE_API` | `1` | run the REST API (`0` to disable) |
-| `OMNIVOICE_API_PORT` | `8001` | REST API port |
-| `OMNIVOICE_API_KEY` | _(unset)_ | require `X-API-Key` header on the API |
+| `OMNIVOICE_MAX_CHARS` | `100` | target characters per chunk |
+
+### Reference audio
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `OMNIVOICE_MAX_REF_SEC` | `10` | trim threshold (cut at the nearest pause below it) |
+| `OMNIVOICE_REF_TAIL_SILENCE` | `0.30` | silence appended to a reference |
+| `OMNIVOICE_REF_MIN_KEEP_SEC` | `3.0` | shortest clip we will cut back to when one ends mid-word |
+| `OMNIVOICE_REF_HARD_MAX_SEC` | `15` | how far past the target we may go to let a sentence finish |
+| `OMNIVOICE_REF_LUFS` | `-20` | reference loudness target |
+| `OMNIVOICE_STRICT_REF` | `1` | reject a `ref_text` that does not match the audio |
+
+### Output & checking
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `OMNIVOICE_VERIFY` | `1` | transcribe every clip back and diff it |
+| `OMNIVOICE_VERIFY_MODE` | `fast` | `fast` = one ASR pass over the finished clip, drilling into chunks only on failure · `strict` = one pass per chunk |
+| `OMNIVOICE_VERIFY_BUDGET` | `45` | seconds; over budget the audio still ships, unverified |
+| `OMNIVOICE_VERIFY_RETRIES` | `1` | regenerations per bad chunk |
+| `OMNIVOICE_NORMALIZE_OUTPUT` | `1` | loudness-normalize the output |
+| `OMNIVOICE_OUT_LUFS` | `-20` | output loudness target |
+| `OMNIVOICE_OUT_PEAK_DB` | `-1.0` | true-peak ceiling |
+| `OMNIVOICE_OUT_TAIL_PAD` | `0.30` | silence appended to each clip so downstream trimming cannot eat the last consonant |
+| `OMNIVOICE_LEVEL_MATCH` | `1` | pull outlier chunks toward the clip's own median level |
+| `OMNIVOICE_RATE_LOW` / `_HIGH` | `0.75` / `1.30` | wpm band around a voice's own baseline (warning only) |
+
+### Limits & stability
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `OMNIVOICE_MAX_INPUT_CHARS` | `8000` | over this → `413` |
+| `OMNIVOICE_MAX_INPUT_WORDS` | `1300` | over this → `413` (~8 min of speech) |
+| `OMNIVOICE_MAX_CONCURRENCY` | `1` | simultaneous generations |
+| `OMNIVOICE_QUEUE_WAIT` | `300` | seconds a caller waits before `429` |
+| `OMNIVOICE_AUTO_RELOAD` | `1` | reload the model after a fatal CUDA error |
+| `OMNIVOICE_SELFTEST` | `1` | background self-test that backs `/api/ready` |
+| `OMNIVOICE_SELFTEST_EVERY` | `120` | seconds between self-tests |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | set automatically |
+
+### Provenance & compliance
+See **[RESEARCH.md](RESEARCH.md) §5** — EU AI Act Article 50 has been enforceable
+since 2 August 2026.
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `OMNIVOICE_WATERMARK` | `0` | inaudible AudioSeal mark on generated audio (needs `pip install audioseal`) |
+| `OMNIVOICE_WATERMARK_ALPHA` | `1.0` | watermark strength |
+| `OMNIVOICE_AUDIT` | `1` | append one line per generation/registration |
+| `OMNIVOICE_AUDIT_LOG` | `./logs/generations.jsonl` | where that goes |
+| `OMNIVOICE_AUDIT_TEXT` | `0` | log full scripts, not just hashes |
+| `OMNIVOICE_REQUIRE_CONSENT` | `0` | refuse voice registration without `consent` + `consent_ref` |
+| `OMNIVOICE_PREWARM_VOICES` | `0` | build every saved voice's prompt at startup |
+
+### Model, server, API
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `OMNIVOICE_MODEL` | `./Model` if present | model path or HF id |
+| `OMNIVOICE_ASR_MODEL` | `openai/whisper-large-v3-turbo` | Whisper (local path ok) |
+| `OMNIVOICE_NUM_STEP` | _(unset)_ | force inference steps |
+| `OMNIVOICE_ATTN` | `sdpa` | attention backend |
+| `OMNIVOICE_OUTPUT_DIR` | `./outputs` | where clips auto-save |
+| `OMNIVOICE_VOICES_DIR` | `./voices` | voice library |
+| `OMNIVOICE_ALLOWED_PATHS` | _(unset)_ | extra folders the browser may download from |
+| `GRADIO_SERVER_NAME` / `_PORT` / `GRADIO_SHARE` | `0.0.0.0` / `7860` / `0` | UI server |
+| `OMNIVOICE_AUTH` | _(unset)_ | `user:pass` UI login |
+| `OMNIVOICE_API` / `_API_PORT` | `1` / `8001` | REST API |
+| `OMNIVOICE_API_KEY` | _(unset)_ | single shared key |
+| `OMNIVOICE_API_KEYS` | _(unset)_ | `k1:acme,k2:globex` — per-customer voice isolation |
+| `OMNIVOICE_STRICT_PARAMS` | `0` | `1` = reject unknown request params with `400` |
+| `OMNIVOICE_HEALTH_STRICT` | `1` | `/api/health` returns `503` when generation is broken |
+| `OMNIVOICE_IDEMPOTENCY_TTL` | `86400` | seconds a replay stays available |
 
 ---
 
 ## Tips
-- Reference audio: **3–10 s**, clean, single speaker (~6 s is the sweet spot).
-- For max speed, drop **Quality steps** to 8–10 (slightly lower quality).
+- Reference audio: **6–10 s**, clean, single speaker, **ending on a finished
+  sentence**. That last part is not a style note — see the playbook.
+- For max speed, drop **Quality steps** to 8–10.
 - Leave **Language = Auto** unless auto-detect picks wrong.
-- RTF is lower (better) on longer scripts — short one-liners show a higher RTF due
-  to fixed per-call overhead; that's normal.
+- RTF is lower (better) on longer scripts; short one-liners show a higher RTF
+  due to fixed per-call overhead.
+- If throughput drops over a long day, check `GET /api/health` → `vram` →
+  `fragmentation_mb` before blaming the model.

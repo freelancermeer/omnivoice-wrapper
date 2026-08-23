@@ -4,7 +4,7 @@ A small **HTTP API** so any machine on your LAN (or scripts on this PC) can send
 **text + a reference voice** and get back an **audio file (mp3/wav)** — using the
 same engine and default settings as the Voiceover Studio UI.
 
-> ✅ **IMPLEMENTED** — the API is live in `app.py`. It runs in the same process as
+> ✅ **LIVE** — implemented in `app.py`. It runs in the same process as
 > the UI on its **own port `8001`** (UI stays on `7860`), sharing the loaded model,
 > GPU lock, and job queue. Interactive docs: **`http://<pc-ip>:8001/api/docs`**.
 >
@@ -79,190 +79,268 @@ queue you already built (and shares the Studio's queue board).
 
 ---
 
+---
+
 ## 3. API reference
 
-**Base URL:** `http://<pc-ip>:8001`  (e.g. `http://192.168.100.76:8001`)
-**Auth:** send `X-API-Key: <your key>` if `OMNIVOICE_API_KEY` is set.
-**Content types:** `multipart/form-data` (with file) or `application/json` (no file).
+Base URL `http://<pc-ip>:8001`. Interactive docs: `/api/docs`.
 
-### 3.1 `GET /api/health`
-Liveness + model status.
+Auth is open by default. Set `OMNIVOICE_API_KEY=<key>` to require an `X-API-Key`
+header, or `OMNIVOICE_API_KEYS=k1:acme,k2:globex` to give each customer their own
+key **and their own private voice library**.
+
+### 3.0 Contract freeze
+
+`POST /api/tts` will not change shape:
+
+* **in:** `multipart/form-data`
+* **out:** raw audio bytes
+* **headers:** `X-Duration-Sec`, `X-RTF` (both still present)
+
+Everything added since is either an **extra response header** (safe to ignore)
+or lives on **`/api/v2/tts`**. Both paths run identical normalization,
+verification and loudness work — only the shape of the reply differs. Unknown
+request parameters are reported in `X-OmniVoice-Warning` rather than rejected,
+so an older client keeps working; set `OMNIVOICE_STRICT_PARAMS=1` to turn that
+into a `400` once you know nobody is sending them.
+
+### 3.1 Health, in three parts
+
+| Endpoint | Answers | Use it for |
+|---|---|---|
+| `GET /api/live` | is the process up? | container liveness |
+| `GET /api/ready` | **did the model actually produce words recently?** | **load balancer, and before starting a batch** |
+| `GET /api/selftest` | generate four words *right now* | manual check; `409` if busy |
+| `GET /api/health` | everything, including VRAM | dashboards |
+| `GET /api/metrics` | counters (generations, OOMs, verify failures, tail trims, replays) | monitoring |
+
+`/api/ready` returns **503 + `Retry-After`** when the last self-test failed or
+is stale. This is the one to trust: a server whose GPU is dead still answers
+`/api/live` happily, and that is exactly how a twenty-minute batch gets started
+against a server that cannot produce a word.
+
 ```json
-{ "status": "ok", "model": "OmniVoice", "device": "cuda",
-  "sampling_rate": 24000, "queue": {"queued": 0, "processing": 0} }
+GET /api/ready   → 503
+{"status": "degraded",
+ "detail": "AcceleratorError: CUDA error: out of memory",
+ "last_selftest_age_s": 41.2,
+ "queue_depth": 0,
+ "vram": {"allocated_mb": 5310, "reserved_mb": 7800,
+          "fragmentation_mb": 2490, "free_mb": 210, "total_mb": 8192},
+ "generation_ok": false, "oom_total": 3}
 ```
 
-### 3.2 `POST /api/tts`  — synchronous, returns audio
-Send text (+ optional voice) → get the audio file back directly.
+`fragmentation_mb` is `reserved − allocated`: memory the allocator holds but
+cannot hand out. That is the "GPU at 5 % utilisation and out of memory" failure,
+and it is invisible if you only look at `allocated`.
 
-**Body (multipart/form-data):**
+### 3.2 `POST /api/tts` — synchronous, returns audio bytes
 
-| Field | Type | Required | Default | Notes |
-|-------|------|----------|---------|-------|
-| `text` | string | ✅ | — | the script to speak |
-| `voice` | file | — | (none) | reference clip (wav/mp3, 3–10 s). Omit = AI voice |
-| `voice_id` | string | — | — | use a registered voice instead of uploading |
-| `ref_text` | string | — | auto | transcript of the voice clip (else Whisper auto) |
-| `language` | string | — | `Auto` | e.g. `English`, `Urdu`, or code `en` |
-| `format` | string | — | `mp3` | `mp3` \| `wav` |
-| `steps` | int | — | `16` | quality steps (8 fast … 32+ better) |
-| `speed` | float | — | `1.0` | 0.5–1.5 |
-| `project` | string | — | `tts` | used for the returned filename |
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `text` | string | **required** | over `OMNIVOICE_MAX_INPUT_CHARS`/`_WORDS` → `413` |
+| `voice` | file | — | reference clip; omit for a designed voice |
+| `voice_id` | string | — | a registered voice; **unknown id → `404`, never a substitute** |
+| `ref_text` | string | — | transcript of `voice`; checked against the audio |
+| `language` | string | `Auto` | `"English"` and other full names are accepted |
+| `format` | `mp3`\|`wav` | `mp3` | |
+| `steps` | int | `16` | 8–10 faster, 32+ better |
+| `speed` | float | `1.0` | |
+| `project` | string | `tts` | used for the filename |
+| `seed` | int | — | seeds torch/numpy before generation |
+| `json` | query `0`\|`1` | `0` | `1` returns JSON and saves the file instead |
 
-**Response:** the audio bytes.
-`200 OK`, `Content-Type: audio/mpeg` (or `audio/wav`),
-`Content-Disposition: attachment; filename="<project>.mp3"`,
-plus headers `X-RTF`, `X-Duration-Sec`, `X-Gen-Sec`.
+Headers on the reply:
 
-**Alt response (`?json=1`):** returns JSON with a download URL instead of raw bytes:
+| Header | Meaning |
+|---|---|
+| `X-Duration-Sec`, `X-RTF` | unchanged, always present |
+| `X-WPM` | measured speaking rate |
+| `X-LUFS`, `X-True-Peak-dB` | measured loudness of what you got |
+| `X-Verified` | `true` if the clip was transcribed back and checked |
+| `X-OmniVoice-Normalized-Text` | exactly what the model was given to say |
+| `X-OmniVoice-Warning` | anything wrong: words dropped, a tail trimmed, loudness missed |
+| `X-OmniVoice-Idempotent-Replay` | `true` when this is a cached replay |
+| `X-OmniVoice-API-Version` | `2.0` |
+
+**Read `X-OmniVoice-Warning`.** It is the difference between shipping a video
+with four missing words and knowing about them.
+
+Send an **`Idempotency-Key`** header and a retry after a client timeout returns
+the cached audio instead of paying for the GPU twice (`409` while the first one
+is still running).
+
+### 3.3 `POST /api/v2/tts` — same inputs, JSON out
+
+Everything the verifier measured, plus the audio inline and on disk. Extra field
+`inline_audio` (`1` by default) controls the base64 payload.
+
 ```json
-{ "ok": true, "project": "intro", "file": "intro.mp3",
-  "download_url": "/api/files/intro.mp3",
-  "duration_sec": 12.6, "gen_sec": 1.9, "rtf": 0.15,
-  "voice": "cloned", "ref_text": "Welcome to the show…" }
+{"ok": true, "project": "intro", "duration_sec": 12.4,
+ "voice": "cloned", "voice_id": "narrator_a",
+ "normalized_text": "five hundred million dollars was appraised at ...",
+ "verified": true, "verification": [],
+ "warnings": [],
+ "wpm": 158.0, "baseline_wpm": 161.0,
+ "loudness": {"in_lufs": -25.6, "out_lufs": -20.0,
+              "true_peak_db": -1.0, "met_target": true, "limited_by": null},
+ "rtf": 0.42, "chunks": 3, "seed": null,
+ "file": "intro_9c1f2a7b.mp3", "download_url": "/api/files/intro_9c1f2a7b.mp3",
+ "audio_base64": "..."}
 ```
 
-### 3.3 `POST /api/tts/async`  — enqueue, returns a job id
-Same fields as `/api/tts`, but returns immediately:
+When something did go wrong, `verification` names it:
+
 ```json
-{ "job_id": 42, "project": "intro", "status": "queued" }
+"verified": true,
+"verification": [{"chunk": 2, "dropped": ["fraud"], "inserted": [],
+                  "word_accuracy": 0.917}],
+"warnings": ["chunk 2: not spoken: fraud"]
 ```
 
-### 3.4 `GET /api/jobs/{id}`  — job status
+### 3.4 `POST /api/tts/async` → `GET /api/jobs/{id}` → `/download`
+
+Same fields (no `format` on submit; choose it at download). The job shares the
+Studio's queue, so async work and the UI cannot fight over the GPU.
+`GET /api/jobs` lists recent jobs. Job status carries `warnings`, `verified`,
+`verification`, `wpm`, `loudness` and `normalized_text`.
+
+### 3.5 `POST /api/voices` — register a reusable voice
+
+`name` (string) + `voice` (file) + optional `ref_text`.
+
+The clip is trimmed at a natural pause, levelled to −20 LUFS, transcribed, and
+measured. The reply is **actionable** — read `warnings` before generating ten
+hours of audio:
+
 ```json
-{ "job_id": 42, "project": "intro", "status": "done",
-  "rtf": 0.15, "duration_sec": 12.6, "download_url": "/api/files/intro.mp3" }
+{"voice_id": "narrator_a", "accepted": true,
+ "ref_text": "the transcript that will actually be used",
+ "quality_score": 0.72, "baseline_wpm": 104, "duration_sec": 9.4,
+ "lufs": -20.0, "snr_db": 11,
+ "warnings": ["reference is noisy (SNR 11 dB) — the cloned voice will carry that noise"],
+ "hint": "docs/reference_playbook.md"}
 ```
-`status` ∈ `queued | processing | done | error | cancelled`.
 
-### 3.5 `GET /api/jobs/{id}/download`  — fetch the audio (when done)
-Returns the audio bytes (respects `format`). `409` if not finished yet.
+If you send a `ref_text` that matches under 90 % of what the recording actually
+says, the upload is **rejected with `422`** and the reply tells you what was
+heard. A mismatched transcript is the main cause of reference words leaking into
+generated clips — being told at upload beats finding out three hours in. Set
+`OMNIVOICE_STRICT_REF=0` to downgrade that to a warning.
 
-### 3.6 `POST /api/voices`  — register a reusable voice (permanent)
-Upload a clip once; get a `voice_id` to reuse forever (survives restarts, shows up
-in the UI dropdown too). The clip is auto-trimmed to ≤10 s.
-**Body:** `voice` (file, ✅), `name` (string), `ref_text` (optional).
+`GET /api/voices` lists them (scoped to your key when multi-tenant).
+`DELETE /api/voices/{voice_id}` removes one. Another tenant's voice reports
+`404`, not `403` — a `403` would confirm the id exists.
+
+Voices survive a restart: `voices/index.json` plus the repaired clip.
+
+### 3.6 `POST /api/transcribe` — check a clip yourself
+
+`audio` (file) + optional `text`. Uses the Whisper already loaded here, so the
+audit that found these bugs costs nothing to repeat.
+
 ```json
-{ "voice_id": "narrator_a", "ref_text": "Welcome to the show…" }
+{"text": "what was actually said",
+ "ok": false,
+ "summary": "extra at end: forcing him to back down",
+ "diff": {"dropped": [], "inserted": ["forcing", "him", "to", "back", "down"],
+          "tail_inserted": ["forcing", "him", "to", "back", "down"],
+          "word_accuracy": 1.0}}
 ```
 
-### 3.7 `GET /api/voices`  — list saved voices
-```json
-{ "voices": [ { "voice_id": "narrator_a", "ref_text": "Welcome…" } ] }
-```
-Also on `GET /api/health` under `"voices": [...]`.
+Note `word_accuracy: 1.0` with a failure: everything sent *was* said, plus five
+words that were not. Accuracy alone can never be the gate.
 
-### 3.8 `DELETE /api/voices/{voice_id}`  — delete a saved voice
-Removes the clip + index entry (same library the UI uses). `404` if unknown.
-```json
-{ "deleted": "narrator_a" }
-```
-```bash
-curl -X DELETE http://localhost:8001/api/voices/narrator_a
-```
-
-> **Duplicate names auto-unique:** registering a name that already exists returns a
-> new unique `voice_id` (e.g. `narrator_a_2`) — existing voices are never overwritten.
-
-### 3.8 `GET /api/files/{name}`  — download a produced file
-Serves from the output folder (respects `OMNIVOICE_OUTPUT_DIR`).
+### 3.7 `GET /api/files/{name}` — download a produced file
 
 ---
 
-## 4. Examples
+## 4. Status codes
 
-### curl — simplest (text only, AI voice → mp3)
+| Code | When | What to do |
+|---|---|---|
+| `400` | empty `text`; unknown params in strict mode | fix the request |
+| `401` | bad or missing `X-API-Key` | |
+| `404` | unknown `voice_id`, job or file | **never** a silent voice substitution |
+| `409` | job not finished; idempotency key still running | obey `Retry-After` |
+| `413` | input over the limit | split it — the message says the limits |
+| `422` | reference rejected (transcript mismatch) | see `detail.message` |
+| `429` | GPU busy past `OMNIVOICE_QUEUE_WAIT` | obey `Retry-After` |
+| `500` | generation failed | |
+| `503` | GPU unavailable / not ready | obey `Retry-After`; check `/api/ready` |
+
+Errors are JSON (`application/json`) even where you asked for audio — check the
+status code before treating the body as a file.
+
+---
+
+## 5. Examples
+
 ```bash
-curl -X POST http://192.168.100.76:8001/api/tts \
-  -F "text=Hello, this is a test of the local voiceover API." \
-  -F "format=mp3" \
-  -o out.mp3
+# simplest: designed voice, mp3 out
+curl -s -X POST http://localhost:8001/api/tts \
+     -F "text=Hello from the API" -F "format=mp3" -o out.mp3
+
+# clone from an uploaded clip
+curl -s -X POST http://localhost:8001/api/tts \
+     -F "text=Hello there." -F "voice=@my_voice.wav" -F "format=wav" -o out.wav
+
+# register once, reuse forever
+curl -s -X POST http://localhost:8001/api/voices \
+     -F "name=narrator_a" -F "voice=@my_voice.wav"
+curl -s -X POST http://localhost:8001/api/tts \
+     -F "text=Second clip, same voice." -F "voice_id=narrator_a" -o clip2.mp3
+
+# see the warnings, not just the audio
+curl -sD - -o out.mp3 -X POST http://localhost:8001/api/tts \
+     -F "text=A property worth \$500 million." -F "voice_id=narrator_a" \
+     | grep -i "^x-"
+
+# retry-safe
+curl -s -X POST http://localhost:8001/api/tts \
+     -H "Idempotency-Key: 3f1c9e2a-..." \
+     -F "text=Bill me once." -F "voice_id=narrator_a" -o once.mp3
+
+# the reference-bleed probe from the bug report
+curl -s -F "text=Trump really is. Is he the businessman he claims?" \
+     -F format=wav -F steps=16 -F voice_id=narrator_a \
+     http://localhost:8001/api/tts -o probe.wav
+curl -s -F "audio=@probe.wav" \
+     -F "text=Trump really is. Is he the businessman he claims?" \
+     http://localhost:8001/api/transcribe
 ```
 
-### curl — clone a voice (upload clip)
-```bash
-curl -X POST http://192.168.100.76:8001/api/tts \
-  -H "X-API-Key: mysecret" \
-  -F "text=Welcome to my channel, subscribe now." \
-  -F "voice=@my_voice.wav" \
-  -F "language=English" -F "steps=16" \
-  -o welcome.mp3
-```
-
-### curl — reuse a registered voice
-```bash
-# register once
-curl -X POST http://192.168.100.76:8001/api/voices \
-  -F "name=narrator_a" -F "voice=@narrator.wav"
-# then use it forever
-curl -X POST http://192.168.100.76:8001/api/tts \
-  -F "text=Chapter one." -F "voice_id=narrator_a" -o ch1.mp3
-```
-
-### Python
 ```python
 import requests
-r = requests.post("http://192.168.100.76:8001/api/tts",
-    data={"text": "Hello from Python", "format": "mp3", "steps": 16},
-    files={"voice": open("my_voice.wav", "rb")},  # optional
-    headers={"X-API-Key": "mysecret"})
-open("out.mp3", "wb").write(r.content)
-print("RTF:", r.headers.get("X-RTF"))
+
+r = requests.post("http://localhost:8001/api/v2/tts", data={
+    "text": "Hello from Python.", "voice_id": "narrator_a", "format": "mp3"})
+r.raise_for_status()
+body = r.json()
+if body["warnings"]:
+    print("check this clip:", body["warnings"])
+open("out.mp3", "wb").write(__import__("base64").b64decode(body["audio_base64"]))
 ```
 
-### JavaScript (Node / browser fetch)
-```js
-const fd = new FormData();
-fd.append("text", "Hello from JS");
-fd.append("format", "mp3");
-// fd.append("voice", fileInput.files[0]);   // optional
-const res = await fetch("http://192.168.100.76:8001/api/tts", { method: "POST", body: fd });
-const blob = await res.blob();   // audio/mpeg
+---
+
+## 6. Running it
+
+The API starts with the app — same process, same GPU, own port.
+
+```powershell
+venv\Scripts\python app.py          REM UI :7860, API :8001
+set OMNIVOICE_API=0                   REM UI only
+set OMNIVOICE_API_PORT=9000           REM different port
+set OMNIVOICE_API_KEY=change-me       REM require X-API-Key
+set OMNIVOICE_API_KEYS=k1:acme,k2:globex   REM per-customer voice isolation
+set OMNIVOICE_MAX_CONCURRENCY=1       REM 1 on an 8 GB card
 ```
 
-### n8n / Make / any HTTP node
-`POST http://<pc>:7860/api/tts`, body = form-data with `text` (+ `voice` file),
-response = binary → save as `.mp3`. Done.
+Before you rely on it:
 
----
+```powershell
+venv\Scripts\python -m pytest tests -q
+venv\Scripts\python tools\acceptance.py --voice narrator_a
+```
 
-## 5. Running it
-No new process — the API starts inside `app.py` (a background thread) on its own
-port. Same launchers:
-- `run.bat` → **UI** at `http://<pc>:7860`, **API** at `http://<pc>:8001/api/...`
-- Optional key: `set OMNIVOICE_API_KEY=mysecret`
-- Disable API: `set OMNIVOICE_API=0` · Change port: `set OMNIVOICE_API_PORT=8080`
-- Interactive docs (auto): **`http://<pc>:8001/api/docs`** (FastAPI Swagger UI) — click-to-try.
-
----
-
-## 6. Implementation plan (when you say "build it")
-Everything reuses code that already exists in `app.py`:
-
-1. Grab the FastAPI instance Gradio creates: `demo.launch(...)` returns / exposes
-   `app.app` (a FastAPI). Add an `APIRouter` with the routes above, or mount before launch.
-2. **Sync `/api/tts`** → save uploaded `voice` to a temp file → call the existing
-   `_get_or_build_prompt()` + `_gen_core_impl()` under `MODEL_LOCK` → get the numpy wav
-   → if `format=mp3`, `pydub.AudioSegment(...).export(bitrate="192k")` → stream bytes back.
-3. **Async `/api/tts/async`** → reuse `add_job()` / the worker queue → `job_id` = the
-   job's id → `GET /api/jobs/{id}` reads the same `JOBS` list; download reads `job["file"]`.
-4. **Voice registry** → a dict `{voice_id: VoiceClonePrompt}` built via `_get_or_build_prompt`
-   (transcribe/encode once). Persist the source clips under `voices/` if you want them to
-   survive restarts.
-5. **mp3** → helper `to_mp3(wav_path_or_array) -> bytes` using pydub (ffmpeg present ✅).
-6. **Auth** → tiny dependency that checks `X-API-Key` against `OMNIVOICE_API_KEY`.
-
-Estimated: ~120–150 lines added to `app.py`, no new heavy deps (fastapi, pydub, ffmpeg
-already installed).
-
----
-
-## 7. Choices for you (tell me before I build)
-1. **Sync only, or sync + async queue?** (I recommend both.)
-2. **Voice registry?** (upload-once, reuse by id — great for repeated narrators.)
-3. **Default format mp3** at 192 kbps ok? (or 128/320, or default wav?)
-4. **API key** on by default, or open on the home LAN?
-5. **Return style for sync:** raw audio bytes (simplest) vs JSON+download URL? (I lean raw
-   bytes, with `?json=1` opt-in.)
-
-Once you pick, I'll wire it into `app.py` and add the endpoints + a couple of tests.

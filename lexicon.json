@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "Pronunciation overrides applied before synthesis. Whole-word, case-sensitive.",
+    "Edit this file and restart the app.",
+    "",
+    "Two uses:",
+    "  1. Acronyms that must be read as a WORD rather than letter by letter.",
+    "     OmniVoice already spells ordinary acronyms correctly (RFK -> 'r f k',",
+    "     CFO -> 'c f o'), so only pronounceable ones belong here.",
+    "  2. Proper nouns the model mispronounces. Write them the way they sound:",
+    "     \"Bessent\": \"Bess ent\"",
+    "     \"Hegseth\": \"Heg seth\"",
+    "",
+    "Set a value to \"\" to switch off one of the built-in defaults, e.g.",
+    "     \"MAGA\": \"\"",
+    "Keys beginning with _ are ignored."
+  ],
+
+  "MAGA": "Maga",
+  "NASA": "Nasa",
+  "NATO": "Nato",
+  "OPEC": "Opec",
+  "NAFTA": "Nafta",
+  "FEMA": "Fema",
+  "UNESCO": "Unesco",
+  "UNICEF": "Unicef",
+  "SCOTUS": "Scotus",
+  "POTUS": "Potus",
+  "FIFA": "Fifa"
+}

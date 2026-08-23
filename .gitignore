@@ -48,3 +48,10 @@ Desktop.ini
 # ── Audio artifacts anywhere in the tree (keep repo clean) ────────────────
 *.wav
 *.zip
+
+# Test / tooling artefacts
+.pytest_cache/
+*.bak
+
+# Generation / consent audit trail (machine-specific)
+logs/

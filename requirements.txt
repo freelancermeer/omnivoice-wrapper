@@ -127,3 +127,10 @@ setuptools==70.2.0
 # sdpa). The wheel below is Windows/Python-3.12/CUDA-12.8 specific. Uncomment
 # only if you know you need it:
 # flash_attn @ https://github.com/kingbri1/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu128torch2.8.0cxx11abiFALSE-cp312-cp312-win_amd64.whl
+
+# ---- OPTIONAL: testing & tooling ----
+# The unit tests need nothing but numpy/scipy/num2words (already above) plus
+# pytest. tools/acceptance.py and tools/audit_batch.py need requests.
+#   venv\Scripts\python -m pip install pytest requests
+# pytest==8.4.2
+# requests is already pinned above (2.34.2)

@@ -1,54 +1,71 @@
 #!/usr/bin/env python3
 """
-Local Gradio launcher for OmniVoice (k2-fsa/OmniVoice).
+OmniVoice Voiceover Studio — local Gradio UI + REST API for k2-fsa/OmniVoice.
 
-Adapted from the official HuggingFace Space app.py, with the ZeroGPU
-(`spaces`) wrapper removed so it runs on a local CUDA GPU, plus fixes for
-several well-known OmniVoice quality/speed issues:
+Adapted from the official HuggingFace Space app.py with the ZeroGPU wrapper
+removed, then hardened against everything a real production batch turned up
+(63 clips / 64.7 minutes / 10,269 words, every clip transcribed back and diffed
+against the script that was sent).
 
-  1. Long reference audio degrades quality (GitHub #50)
-     -> reference audio is auto-trimmed to <= OMNIVOICE_MAX_REF_SEC (default 10s;
-        the model was trained on 3-10s references, ~6s is the sweet spot).
+WHAT THE BATCH FOUND, AND WHERE IT IS FIXED
+-------------------------------------------
+1. Reference audio leaked into every clip — 218 words that were never sent, one
+   voice contributing 185 of them ("forcing" x163). Root cause: a 60s reference
+   hard-cut at exactly MAX_REF_SEC landed mid-word, and the model kept finishing
+   that word.                        -> audio_fx.smart_trim_reference (cut at a
+                                        real pause), reference validation at
+                                        registration, and a verifier that trims
+                                        a confirmed tail artefact.
+2. Words silently dropped — 12 of them, mostly one arm of a repeated structure
+   ("He called it perjury / fraud / contempt" lost the middle clause), with
+   nothing reporting it.             -> verify.word_diff on every chunk, retry,
+                                        and a warning the caller can see.
+3. Output loudness tracked the reference (-0.2 dB to -12.6 dB in one batch).
+                                     -> BS.1770 loudness normalization on both
+                                        the reference and the output.
+4. CUDA OOM that never recovered, while /api/health said "ok".
+                                     -> gpu_guard: inference_mode, explicit del,
+                                        bounded concurrency, OOM recovery, and
+                                        /api/ready backed by a real self-test.
+5. Rushed short clips, 133-203 wpm across one batch.
+                                     -> balanced chunking, and wpm measured and
+                                        reported against each voice's own
+                                        baseline (a metric, never a gate).
+6. Numbers/currency/dashes/acronyms  -> textnorm, with the normalized text
+                                        returned so it can be checked without
+                                        listening to twenty minutes of audio.
 
-  2. Number normalization ("123" -> garbled)
-     -> text is run through a num2words-based front-end before synthesis.
+API CONTRACT: POST /api/tts is frozen — multipart in, raw audio bytes out, with
+the X-Duration-Sec and X-RTF headers it always had. Everything new is either an
+additional response header or lives on /api/v2/tts. See LOCAL_API.md.
 
-  3. Mathematical / phone-number / long digit sequences sound wrong
-     -> long digit runs and phone-style numbers are read digit-by-digit.
-
-  4. Slow inference on consumer GPUs
-     -> FP16 (already default), optional torch.compile of the LLM backbone
-        (OMNIVOICE_COMPILE=1), and an optional step-count override
-        (OMNIVOICE_NUM_STEP, e.g. 16) for a 20-30% speedup.
-
-Run:  python app.py
-The model (~3.3 GB) auto-downloads from HuggingFace on first launch and is
-cached under ~/.cache/huggingface (or HF_HOME if set).
-
-Environment variables:
-  OMNIVOICE_MODEL        model id / path        (default: k2-fsa/OmniVoice)
-  OMNIVOICE_MAX_REF_SEC  max reference seconds  (default: 10)
-  OMNIVOICE_NORMALIZE    number normalization   (default: 1, set 0 to disable)
-  OMNIVOICE_NUM_STEP     force inference steps   (unset = use UI slider; 16 = faster)
-  OMNIVOICE_COMPILE      torch.compile the LLM   (default: 0; needs Triton)
-  GRADIO_SERVER_NAME / GRADIO_SERVER_PORT / GRADIO_SHARE
+Run:  python app.py       (UI on :7860, API on :8001)
 """
 
+import os
+
+# MUST be set before torch initialises CUDA. Made for long-running processes
+# whose allocations vary in size, which is exactly a TTS server: it lets the
+# allocator grow a segment instead of fragmenting into unusable holes — the
+# "GPU at 5% utilisation and out of memory" failure.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import base64
 import datetime
 import html as html_mod
+import io
 import json
 import logging
-import os
 import queue as queue_mod
-import shutil
 import socket
 import re
 import sys
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Windows consoles default to cp1252 and crash when logging non-Latin text
 # (language names, normalized output, etc.). Force UTF-8 with replacement.
@@ -71,24 +88,25 @@ import numpy as np
 import soundfile as sf
 import torch
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
-from omnivoice.cli.demo import _ALL_LANGUAGES, _ATTR_INFO, _CATEGORIES
-from omnivoice.utils.lang_map import LANG_NAME_TO_ID
+from omnivoice.cli.demo import _ALL_LANGUAGES
 
-# Number normalization front-end -------------------------------------------------
-try:
-    from num2words import num2words
-    from num2words import CONVERTER_CLASSES as _N2W_CLASSES
+import audio_fx
+import gpu_guard
+import textnorm
+import verify
+import watermark
 
-    _N2W_LANGS = set(_N2W_CLASSES.keys())
-except Exception:  # pragma: no cover - num2words optional
-    num2words = None
-    _N2W_LANGS = set()
+API_VERSION = "2.0"
 
 # ---------------------------------------------------------------------------
 # Config from environment
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _LOCAL_MODEL = os.path.join(_HERE, "Model")
+
+
+def _env_flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _default_checkpoint() -> str:
@@ -98,165 +116,239 @@ def _default_checkpoint() -> str:
     return "k2-fsa/OmniVoice"
 
 
-# OMNIVOICE_MODEL overrides; otherwise use the local ./Model dir if present.
 CHECKPOINT = os.environ.get("OMNIVOICE_MODEL") or _default_checkpoint()
-# Whisper ASR for auto-transcribing reference text. Point this at a local path
-# to avoid downloading it from HuggingFace.
 ASR_MODEL = os.environ.get("OMNIVOICE_ASR_MODEL", "openai/whisper-large-v3-turbo")
-MAX_REF_SEC = float(os.environ.get("OMNIVOICE_MAX_REF_SEC", "10"))
-NORMALIZE = os.environ.get("OMNIVOICE_NORMALIZE", "1") == "1"
-FORCE_NUM_STEP = os.environ.get("OMNIVOICE_NUM_STEP")  # None or e.g. "16"
-DO_COMPILE = os.environ.get("OMNIVOICE_COMPILE", "0") == "1"
-CHUNK = os.environ.get("OMNIVOICE_CHUNK", "1") == "1"
+
+# --- text front-end -------------------------------------------------------
+NORMALIZE_LEVEL = os.environ.get("OMNIVOICE_NORMALIZE_LEVEL", "").strip().lower()
+if not NORMALIZE_LEVEL:
+    # Back-compat with the old on/off switch.
+    NORMALIZE_LEVEL = "full" if _env_flag("OMNIVOICE_NORMALIZE") else "off"
+LEXICON_PATH = os.environ.get("OMNIVOICE_LEXICON", os.path.join(_HERE, "lexicon.json"))
+YEAR_STYLE = _env_flag("OMNIVOICE_YEARS")
+LEXICON = textnorm.load_lexicon(LEXICON_PATH)
+
+CHUNK = _env_flag("OMNIVOICE_CHUNK")
 MAX_CHARS = int(os.environ.get("OMNIVOICE_MAX_CHARS", "100"))
 GAP_SEC = float(os.environ.get("OMNIVOICE_CHUNK_GAP", "0.15"))
-# Chunks generated together per GPU batch. Default 1 (sequential): batching
-# pads all chunks to the longest one, which wastes compute on short chunks and
-# usually *raises* RTF. Opt in with OMNIVOICE_BATCH>1 only if chunks are long
-# and uniform. Auto-halves on CUDA OOM.
+
+# --- reference audio ------------------------------------------------------
+# The reference length we aim for. NOT a hard cut: see REF_HARD_MAX_SEC.
+MAX_REF_SEC = float(os.environ.get("OMNIVOICE_MAX_REF_SEC", "10"))
+# How far past the target we will go to let a sentence finish, rather than
+# backing off to a much earlier pause and shipping a thin reference.
+REF_HARD_MAX_SEC = float(os.environ.get("OMNIVOICE_REF_HARD_MAX_SEC", "15"))
+REF_TAIL_SILENCE = float(os.environ.get("OMNIVOICE_REF_TAIL_SILENCE", "0.30"))
+REF_TARGET_LUFS = float(os.environ.get("OMNIVOICE_REF_LUFS", "-20"))
+# Shortest reference we are willing to cut back to when a clip ends mid-word.
+REF_MIN_KEEP_SEC = float(os.environ.get("OMNIVOICE_REF_MIN_KEEP_SEC", "3.0"))
+STRICT_REF = _env_flag("OMNIVOICE_STRICT_REF")
+
+# --- output ---------------------------------------------------------------
+NORMALIZE_OUTPUT = _env_flag("OMNIVOICE_NORMALIZE_OUTPUT")
+OUT_TARGET_LUFS = float(os.environ.get("OMNIVOICE_OUT_LUFS", "-20"))
+OUT_PEAK_CEILING = float(os.environ.get("OMNIVOICE_OUT_PEAK_DB", "-1.0"))
+# Silence appended to every finished clip. Silence-stripping downstream is a
+# documented way to lose a final consonant; 0.3s of headroom costs nothing.
+OUT_TAIL_PAD = float(os.environ.get("OMNIVOICE_OUT_TAIL_PAD", "0.30"))
+# Pull outlier chunks toward the clip's own median level (not to a fixed
+# target, which is what makes stitched long-form output jump in volume).
+LEVEL_MATCH = _env_flag("OMNIVOICE_LEVEL_MATCH")
+
+# --- provenance & compliance ---------------------------------------------
+# EU AI Act Article 50 (enforceable 2 August 2026) obliges the provider of a
+# synthetic-audio system to mark its output machine-readably. Off by default
+# because it needs an extra package; turn it on before selling into the EU.
+# Only ever applied to generated audio, never to a customer's own recording.
+WATERMARK = _env_flag("OMNIVOICE_WATERMARK", "0")
+WATERMARK_ALPHA = float(os.environ.get("OMNIVOICE_WATERMARK_ALPHA", "1.0"))
+# "consent at enrolment, watermark at generation, detect on complaint" — the
+# audit log is the third leg, and the one a dispute actually turns on.
+AUDIT = _env_flag("OMNIVOICE_AUDIT")
+AUDIT_LOG = os.environ.get("OMNIVOICE_AUDIT_LOG",
+                           os.path.join(_HERE, "logs", "generations.jsonl"))
+# Scripts are the customer's content: hashes by default, full text only on
+# request.
+AUDIT_TEXT = _env_flag("OMNIVOICE_AUDIT_TEXT", "0")
+REQUIRE_CONSENT = _env_flag("OMNIVOICE_REQUIRE_CONSENT", "0")
+PREWARM_VOICES = _env_flag("OMNIVOICE_PREWARM_VOICES", "0")
+
+# --- verification ---------------------------------------------------------
+VERIFY = _env_flag("OMNIVOICE_VERIFY")
+VERIFY_BUDGET_S = float(os.environ.get("OMNIVOICE_VERIFY_BUDGET", "45"))
+VERIFY_RETRIES = int(os.environ.get("OMNIVOICE_VERIFY_RETRIES", "1"))
+# "fast"   - one ASR pass over the finished clip; drill into chunks only when
+#            that pass finds something wrong. A clean job is the common case,
+#            and this is what keeps RTF close to unverified.
+# "strict" - one ASR pass per chunk, always.
+VERIFY_MODE = os.environ.get("OMNIVOICE_VERIFY_MODE", "fast").strip().lower()
+# Speaking rate is compared to each voice's OWN baseline, never to a fixed band.
+verify.RATE_LOW = float(os.environ.get("OMNIVOICE_RATE_LOW", verify.RATE_LOW))
+verify.RATE_HIGH = float(os.environ.get("OMNIVOICE_RATE_HIGH", verify.RATE_HIGH))
+
+# --- generation -----------------------------------------------------------
+FORCE_NUM_STEP = os.environ.get("OMNIVOICE_NUM_STEP")
+DO_COMPILE = _env_flag("OMNIVOICE_COMPILE", "0")
 BATCH = int(os.environ.get("OMNIVOICE_BATCH", "1"))
 
+# --- limits (D8: one place, read everywhere) ------------------------------
+MAX_INPUT_CHARS = int(os.environ.get("OMNIVOICE_MAX_INPUT_CHARS", "8000"))
+MAX_INPUT_WORDS = int(os.environ.get("OMNIVOICE_MAX_INPUT_WORDS", "1300"))
+MAX_CONCURRENCY = int(os.environ.get("OMNIVOICE_MAX_CONCURRENCY", "1"))
+QUEUE_WAIT_S = float(os.environ.get("OMNIVOICE_QUEUE_WAIT", "300"))
 
-# ---------------------------------------------------------------------------
-# Fix #2 / #3: text / number normalization
-# ---------------------------------------------------------------------------
-# Capture a digit run that may contain ., , or - as internal separators.
-_NUM_RE = re.compile(r"\d[\d.,\-]*\d|\d")
-
-
-def _resolve_n2w_lang(language: Optional[str], text: str) -> Optional[str]:
-    """Map an OmniVoice language label to a num2words language code.
-
-    Returns None when normalization should be skipped (unsupported language or
-    auto-detect on non-Latin text), so we never corrupt non-Latin scripts.
-    """
-    if num2words is None:
-        return None
-
-    if not language or language == "Auto":
-        # Only safe to assume English digits for predominantly ASCII text.
-        if any(ord(c) > 0x2FF for c in text):
-            return None
-        return "en" if "en" in _N2W_LANGS else None
-
-    code = LANG_NAME_TO_ID.get(language.lower(), language.lower())
-    if code in _N2W_LANGS:
-        return code
-    base = code.split("_")[0]
-    return base if base in _N2W_LANGS else None
-
-
-def normalize_numbers(text: str, language: Optional[str]) -> str:
-    """Convert digit sequences to spoken words (language-aware).
-
-    - Long runs (>= 7 digits, e.g. phone numbers) -> read digit by digit.
-    - Decimals -> "<int> point <digits>" via num2words float handling.
-    - Plain integers (incl. thousands separators) -> cardinal words.
-    Falls back to leaving the original token untouched on any failure.
-    """
-    if not NORMALIZE or not text:
-        return text
-    code = _resolve_n2w_lang(language, text)
-    if code is None:
-        return text
-
-    def repl(m: "re.Match") -> str:
-        tok = m.group(0)
-        digits = re.sub(r"\D", "", tok)
-        if not digits:
-            return tok
-        try:
-            # Phone-like / long sequences -> digit by digit.
-            if len(digits) >= 7:
-                return " ".join(num2words(int(d), lang=code) for d in digits)
-            # Ambiguous short hyphenated tokens (e.g. "1-2") -> leave as-is.
-            if "-" in tok:
-                return tok
-            clean = tok.replace(",", "")
-            if "." in clean:
-                return num2words(float(clean), lang=code)
-            return num2words(int(clean), lang=code)
-        except Exception:
-            return tok
-
-    out = _NUM_RE.sub(repl, text)
-    if out != text:
-        log.info("Normalized text [%s]: %r -> %r", code, text, out)
-    return out
+# --- recovery -------------------------------------------------------------
+AUTO_RELOAD = _env_flag("OMNIVOICE_AUTO_RELOAD")
+SELFTEST = _env_flag("OMNIVOICE_SELFTEST")
+SELFTEST_EVERY = float(os.environ.get("OMNIVOICE_SELFTEST_EVERY", "120"))
+SELFTEST_STALE = float(os.environ.get("OMNIVOICE_SELFTEST_STALE", "600"))
 
 
 # ---------------------------------------------------------------------------
-# Fix: long-text degeneration into non-speech audio (GitHub #144) +
-#      voice drift across chunks (GitHub #44).
-# Split long text on sentence boundaries into ~MAX_CHARS chunks, synthesize
-# each chunk separately, and concatenate. A single shared voice (one
-# VoiceClonePrompt) is reused across all chunks to keep the timbre consistent.
+# Text front-end (see textnorm.py — unit-tested without a GPU)
 # ---------------------------------------------------------------------------
-# Sentence terminators for both Latin (. ! ?) and CJK (。！？…) scripts.
-_SENT_SPLIT_RE = re.compile(r"(?<=[.!?。！？…])\s*")
+def normalize_for_tts(text: str, language: Optional[str]) -> Tuple[str, List[str]]:
+    return textnorm.normalize_text(text, language, level=NORMALIZE_LEVEL,
+                                   lexicon=LEXICON, years=YEAR_STYLE)
 
 
-def chunk_text(text: str, max_chars: int = MAX_CHARS):
-    """Split text at sentence boundaries, packing sentences up to max_chars."""
-    sentences = [s for s in _SENT_SPLIT_RE.split(text) if s and s.strip()]
-    chunks, current = [], ""
-    for s in sentences:
-        s = s.strip()
-        if not current:
-            current = s
-        elif len(current) + 1 + len(s) <= max_chars:
-            current += " " + s
-        else:
-            chunks.append(current)
-            current = s
-        # A single sentence longer than max_chars stays as its own chunk.
-    if current:
-        chunks.append(current)
-    return chunks or [text]
+def chunk_text(text: str, max_chars: int = MAX_CHARS) -> List[str]:
+    return textnorm.chunk_text(text, max_chars)
 
 
 def concat_audio(parts, sr, gap_sec=GAP_SEC):
-    """Concatenate float waveforms with a short silence between them."""
-    if not parts:
-        return np.zeros(0, dtype=np.float32)
-    gap = np.zeros(int(gap_sec * sr), dtype=np.float32)
-    out = []
-    for i, p in enumerate(parts):
-        if i:
-            out.append(gap)
-        out.append(np.asarray(p, dtype=np.float32).reshape(-1))
-    return np.concatenate(out)
+    return audio_fx.concat_audio(parts, sr, gap_sec)
+
+
+def check_input_size(text: str) -> Optional[str]:
+    """One limit, one message, used by every entry point."""
+    n_chars, n_words = len(text or ""), textnorm.word_count(text)
+    if n_chars > MAX_INPUT_CHARS:
+        return (f"text is {n_chars} characters; the limit is {MAX_INPUT_CHARS}. "
+                f"Split it into separate requests.")
+    if n_words > MAX_INPUT_WORDS:
+        return (f"text is {n_words} words; the limit is {MAX_INPUT_WORDS} "
+                f"(about 8 minutes of speech). Split it into separate requests.")
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Fix #1: trim long reference audio (GitHub #50)
+# Reference audio handling
 # ---------------------------------------------------------------------------
-def trim_reference(path: str):
-    """Trim a reference clip to the first MAX_REF_SEC seconds if it is longer.
+def read_audio(path: str) -> Tuple[np.ndarray, int]:
+    data, sr = sf.read(path, dtype="float32", always_2d=False)
+    return audio_fx.to_mono_float(data), int(sr)
 
-    Returns (path_to_use, duration_seconds, was_trimmed). On any error the
-    original path is returned unchanged.
+
+def write_wav(path: str, x: np.ndarray, sr: int) -> None:
+    sf.write(path, audio_fx.to_int16(x), sr, subtype="PCM_16")
+
+
+def _merge_ref_warnings(report: Dict, trim_info: Dict) -> List[str]:
+    """Analysis runs before the repair, so drop what the repair just fixed.
+
+    Telling a customer "your reference ends without a pause" *and* "it was cut
+    back to the last finished phrase" in the same breath reads like two
+    problems. It is one problem and its fix.
     """
+    stale = "ends without a pause"
+    before = [w for w in report.get("warnings", [])
+              if not (trim_info.get("repaired_mid_word") and stale in w)]
+    return before + list(trim_info.get("warnings", []))
+
+
+def prepare_reference(path: str, normalize: bool = True) -> Tuple[str, Dict]:
+    """Trim at a real pause, level it, and write a clean temp wav.
+
+    This is the fix for the worst bug in the batch. The old code cut at exactly
+    MAX_REF_SEC, which for one 60s reference landed mid-word — and that half
+    word was then spoken at the end of 86-90% of the clips made with it.
+    """
+    info: Dict[str, Any] = {"source": path, "warnings": []}
     try:
-        info = sf.info(path)
-        dur = info.frames / float(info.samplerate)
-    except Exception as e:
+        x, sr = read_audio(path)
+    except Exception as e:  # noqa: BLE001
         log.warning("Could not read reference audio %s: %s", path, e)
-        return path, None, False
+        info["warnings"].append(f"could not read reference audio: {e}")
+        return path, info
 
-    if dur <= MAX_REF_SEC:
-        return path, dur, False
+    info.update(audio_fx.analyze_reference(x, sr, max_sec=MAX_REF_SEC * 3))
+    y, trim_info = audio_fx.smart_trim_reference(
+        x, sr, max_sec=MAX_REF_SEC, tail_silence_sec=REF_TAIL_SILENCE,
+        min_keep_sec=REF_MIN_KEEP_SEC, hard_max_sec=REF_HARD_MAX_SEC)
+    info["warnings"] = _merge_ref_warnings(info, trim_info)
+    info.update({k: v for k, v in trim_info.items() if k != "warnings"})
 
+    if normalize:
+        y, loud = audio_fx.normalize_loudness(
+            y, sr, target_lufs=REF_TARGET_LUFS, peak_ceiling_db=OUT_PEAK_CEILING)
+        info["reference_loudness"] = loud
+
+    fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="omnivoice_ref_")
+    os.close(fd)
     try:
-        data, sr = sf.read(path, frames=int(MAX_REF_SEC * info.samplerate))
-        fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="omnivoice_ref_")
-        os.close(fd)
-        sf.write(tmp, data, sr)
-        log.info("Trimmed reference %.1fs -> %.1fs", dur, MAX_REF_SEC)
-        return tmp, MAX_REF_SEC, True
-    except Exception as e:
-        log.warning("Reference trim failed, using original: %s", e)
-        return path, dur, False
+        write_wav(tmp, y, sr)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not write prepared reference: %s", e)
+        return path, info
+    info["prepared_path"] = tmp
+    info["sample_rate"] = sr
+    return tmp, info
+
+
+def trim_reference(path: str):
+    """Back-compat shim: (path_to_use, duration_seconds, was_trimmed)."""
+    prepared, info = prepare_reference(path)
+    return prepared, info.get("duration_sec"), bool(info.get("trimmed"))
+
+
+# ---------------------------------------------------------------------------
+# Audit trail
+# ---------------------------------------------------------------------------
+_AUDIT_LOCK = threading.Lock()
+
+
+def _sha(data) -> str:
+    import hashlib as _h
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return _h.sha256(data).hexdigest()[:32]
+
+
+def audit(event: str, **fields) -> None:
+    """Append one line per generation and per voice registration.
+
+    A voice-cloning business is one complaint away from having to show who
+    made a clip, from which voice, and on whose authority. Reconstructing that
+    afterwards is impossible; writing 300 bytes at the time is free.
+    """
+    if not AUDIT:
+        return
+    rec = {"ts": datetime.datetime.now(datetime.timezone.utc)
+           .isoformat(timespec="seconds"), "event": event}
+    rec.update({k: v for k, v in fields.items() if v is not None})
+    try:
+        os.makedirs(os.path.dirname(AUDIT_LOG) or ".", exist_ok=True)
+        line = json.dumps(rec, ensure_ascii=False)
+        with _AUDIT_LOCK:
+            with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception as e:  # noqa: BLE001 - logging must never break a render
+        log.warning("could not write the audit log: %s", e)
+
+
+def audit_generation(text, rep, voice_id=None, owner=None, project=None,
+                     wav=None, sr=None, source="api") -> None:
+    audit("generation",
+          source=source, tenant=owner, voice_id=voice_id, project=project,
+          text_sha256=_sha(text or ""), text_chars=len(text or ""),
+          text=(text if AUDIT_TEXT else None),
+          audio_sha256=(_sha(wav.tobytes()) if wav is not None else None),
+          duration_sec=rep.get("audio_sec"), wpm=rep.get("wpm"),
+          verified=rep.get("verified"),
+          warnings=(rep.get("warnings") or None),
+          watermarked=(rep.get("watermark") or {}).get("watermarked"),
+          rtf=rep.get("rtf"), seed=rep.get("seed"))
 
 
 # ---------------------------------------------------------------------------
@@ -264,9 +356,7 @@ def trim_reference(path: str):
 # ---------------------------------------------------------------------------
 if torch.cuda.is_available():
     device_map = "cuda"
-    dtype = torch.float16  # Fix #4: FP16 by default
-    # Free perf tweak: TF32 matmuls. (cudnn.benchmark is intentionally OFF — TTS
-    # inputs vary in length, so autotuning re-runs per shape and HURTS latency.)
+    dtype = torch.float16
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = False
@@ -277,10 +367,6 @@ else:
     print(f"CUDA not available -> loading {CHECKPOINT} on CPU (this will be slow) ...")
 
 print(f"Checkpoint: {CHECKPOINT}")
-# Attention backend. NOTE: OmniVoice (as of 0.1.5) does NOT support
-# flash_attention_2 — it raises at load — so we default to "sdpa" (fast, built
-# in, no extra package). You can still try flash via OMNIVOICE_ATTN if a future
-# model version adds support; it auto-falls back to sdpa on failure.
 _ATTN = os.environ.get("OMNIVOICE_ATTN", "sdpa")
 
 
@@ -307,9 +393,6 @@ except Exception as e:
         raise
 sampling_rate = model.sampling_rate
 
-# Fix #4: optional torch.compile of the LLM backbone (the dominant cost).
-# Disabled by default: on Windows the Inductor backend needs Triton, which has
-# no official Windows wheels, so compilation typically fails there.
 if DO_COMPILE:
     try:
         if hasattr(model, "llm") and model.llm is not None:
@@ -321,20 +404,95 @@ if DO_COMPILE:
         log.warning("torch.compile failed (%s); continuing uncompiled", e)
 
 
-# Single GPU -> one model op at a time. Serializes the batch worker and the
-# interactive tabs so they never touch CUDA concurrently.
-MODEL_LOCK = threading.Lock()
+# Single GPU -> one model op at a time.
+MODEL_LOCK = threading.RLock()
+# Bounds how many generations are in flight at once. Four concurrent callers
+# killed the old server in under a minute; a client should not be able to
+# oversubscribe the card by sending more requests.
+GEN_SLOTS = threading.BoundedSemaphore(max(1, MAX_CONCURRENCY))
+HEALTH = gpu_guard.GpuHealth()
+READY = gpu_guard.Readiness(stale_after=SELFTEST_STALE)
+STARTED_AT = time.time()
+METRICS = {"generations": 0, "verify_failures": 0, "verify_skipped": 0,
+           "tail_trims": 0, "regenerations": 0, "oom": 0,
+           "unknown_params": {}, "idempotent_replays": 0}
+METRICS_LOCK = threading.Lock()
+
+
+def _bump(key: str, n: int = 1) -> None:
+    with METRICS_LOCK:
+        METRICS[key] = METRICS.get(key, 0) + n
+
+
+def reload_model() -> None:
+    """Last-resort recovery from a poisoned CUDA context.
+
+    Held under MODEL_LOCK so nobody can run against a half-loaded model. Every
+    cached voice prompt is invalidated, because the old ones belong to tensors
+    that no longer exist.
+    """
+    global model, sampling_rate
+    with MODEL_LOCK:
+        log.warning("reloading the model after a fatal CUDA error")
+        try:
+            old = model
+            model = None  # type: ignore
+            del old
+        except Exception:  # noqa: BLE001
+            pass
+        gpu_guard.free_cuda()
+        model = _load_model(_ATTN if _ATTN == "sdpa" else "sdpa")
+        sampling_rate = model.sampling_rate
+        _invalidate_voice_prompts()
+        log.warning("model reloaded")
+
+
+_RELOAD_HOOK = reload_model if AUTO_RELOAD else None
+
+
+def call_model(fn, label="generate"):
+    """Every single model call goes through here: one at a time, no autograd,
+    memory freed afterwards, OOM handled."""
+    def _run():
+        with MODEL_LOCK:
+            return fn()
+
+    try:
+        return gpu_guard.guarded(_run, retries=1, health=HEALTH,
+                                 on_reload=_RELOAD_HOOK, label=label)
+    except BaseException as exc:
+        if gpu_guard.is_oom(exc):
+            _bump("oom")
+        raise
 
 
 # ---------------------------------------------------------------------------
-# Generation core (mirrors omnivoice.cli.demo, with the fixes applied)
+# Generation core
 # ---------------------------------------------------------------------------
 class _Cancelled(Exception):
     """Raised to abort generation when a job is cancelled."""
 
 
+def _transcribe_path(path: str) -> str:
+    return call_model(lambda: model.transcribe(path), label="transcribe") or ""
+
+
+def _transcribe_audio(x: np.ndarray, sr: int) -> str:
+    """ASR on an in-memory waveform (used by the verifier)."""
+    fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="omnivoice_vfy_")
+    os.close(fd)
+    try:
+        write_wav(tmp, x, sr)
+        return _transcribe_path(tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _gen_core(*args, **kwargs):
-    # Note: the GPU lock is taken per model call (per chunk / per prompt / per
+    # The GPU lock is taken per model call (per chunk / per prompt / per
     # transcription), NOT around the whole job — so an upload-transcription can
     # run between chunks while a long job is processing.
     return _gen_core_impl(*args, **kwargs)
@@ -356,21 +514,39 @@ def _gen_core_impl(
     ref_text=None,
     cancel_check=None,
     prebuilt_prompt=None,
+    report=None,
+    seed=None,
+    baseline_wpm=None,
 ):
+    """Synthesize `text`. Returns ((sr, int16 waveform), status) as it always
+    has; everything new is written into `report` so no caller breaks."""
+    rep: Dict[str, Any] = report if report is not None else {}
+    rep.setdefault("warnings", [])
+    rep.setdefault("notes", [])
+    rep.setdefault("verified", False)
+
     if not text or not text.strip():
         return None, "Please enter the text to synthesize."
 
-    notes = []
+    too_big = check_input_size(text)
+    if too_big:
+        return None, f"Error: {too_big}"
 
-    # Fix #4: optional forced step count (e.g. OMNIVOICE_NUM_STEP=16 for speed).
+    notes: List[str] = rep["notes"]
+    warnings: List[str] = rep["warnings"]
+
     if FORCE_NUM_STEP:
         num_step = FORCE_NUM_STEP
         notes.append(f"steps forced to {FORCE_NUM_STEP}")
 
-    # Fix #2/#3: normalize numbers before synthesis.
-    syn_text = normalize_numbers(text.strip(), language)
-    if syn_text != text.strip():
-        notes.append("numbers normalized")
+    syn_text, norm_notes = normalize_for_tts(text.strip(), language)
+    notes.extend(norm_notes)
+    rep["normalized_text"] = syn_text
+    rep["original_text"] = text.strip()
+
+    gpu_guard.seed_everything(seed)
+    if seed is not None:
+        rep["seed"] = int(seed)
 
     gen_config = OmniVoiceGenerationConfig(
         num_step=int(num_step or 32),
@@ -381,11 +557,7 @@ def _gen_core_impl(
     )
 
     lang = language if (language and language != "Auto") else None
-
-    kw: Dict[str, Any] = dict(
-        text=syn_text, language=lang, generation_config=gen_config
-    )
-
+    kw: Dict[str, Any] = dict(text=syn_text, language=lang, generation_config=gen_config)
     if speed is not None and float(speed) != 1.0:
         kw["speed"] = float(speed)
     if duration is not None and float(duration) > 0:
@@ -393,51 +565,52 @@ def _gen_core_impl(
 
     instruct_val = instruct.strip() if (instruct and instruct.strip()) else None
 
-    # Decide chunking (Fix #144): split long text on sentence boundaries.
-    # Skip when a fixed Duration is set — that is a whole-utterance target that
-    # cannot be meaningfully divided across chunks.
     duration_set = duration is not None and float(duration) > 0
     if CHUNK and not duration_set and len(syn_text) > MAX_CHARS:
         chunks = chunk_text(syn_text, MAX_CHARS)
     else:
         chunks = [syn_text]
+    rep["chunks"] = len(chunks)
 
-    # Build the (single, shared) voice for the whole utterance.
+    # ---- the voice ------------------------------------------------------
     clone_prompt = None
     if prebuilt_prompt is not None:
-        # Reuse a voice prompt built once (bulk add: same voice, many scripts).
         clone_prompt = prebuilt_prompt
     elif mode == "clone":
         if not ref_audio:
             return None, "Please upload a reference audio."
-        # Fix #1: trim overly long references (model trained on 3-10s clips).
-        ref_path, ref_dur, trimmed = trim_reference(ref_audio)
-        if trimmed:
+        ref_path, ref_info = prepare_reference(ref_audio)
+        warnings.extend(ref_info.get("warnings", []))
+        if ref_info.get("trimmed"):
             notes.append(
-                f"reference trimmed {ref_dur:.0f}s -> {MAX_REF_SEC:.0f}s"
-                if ref_dur else "reference trimmed"
-            )
-        elif ref_dur is not None and ref_dur < 3:
-            notes.append("warning: reference < 3s may reduce quality")
+                ("reference cut back from a mid-word ending to "
+                 if ref_info.get("repaired_mid_word") else "reference trimmed to ")
+                + f"{ref_info.get('cut_sec')}s"
+                + (" at a pause" if ref_info.get("cut_at_pause") else "")
+                + (f" (+{ref_info['overshoot_sec']}s to finish the sentence)"
+                   if ref_info.get("overshoot_sec") else ""))
+            if ref_text:
+                # The supplied transcript describes the untrimmed clip, so it no
+                # longer matches the audio — and a mismatched ref_text is the
+                # main cause of reference words leaking into every clip.
+                warnings.append("the supplied reference transcript was replaced: "
+                                "the clip had to be trimmed, so the transcript no "
+                                "longer matched the audio")
+                ref_text = None
         try:
-            # ref_text=None -> auto-transcribed by multilingual Whisper.
-            with MODEL_LOCK:
-                clone_prompt = model.create_voice_clone_prompt(
-                    ref_audio=ref_path,
-                    ref_text=ref_text,
-                )
+            clone_prompt = call_model(
+                lambda: model.create_voice_clone_prompt(ref_audio=ref_path,
+                                                        ref_text=ref_text),
+                label="clone_prompt")
         except Exception as e:
             return None, f"Error creating voice prompt: {type(e).__name__}: {e}"
         if not ref_text:
             notes.append("ref text auto-transcribed (Whisper)")
 
-    # Generate in mini-batches for GPU parallelism. A single shared voice
-    # prompt is broadcast across the batch, keeping the timbre consistent
-    # (Fix #44). Batch size auto-halves on CUDA OOM.
-    def _run_batches(texts, prompt, inst, batch_size):
-        out_parts = []
-        i = 0
-        bs = max(1, batch_size)
+    # ---- generation -----------------------------------------------------
+    def _generate(texts, prompt, inst, batch_size):
+        out_parts: List[np.ndarray] = []
+        i, bs = 0, max(1, batch_size)
         while i < len(texts):
             if cancel_check and cancel_check():
                 raise _Cancelled()
@@ -448,81 +621,305 @@ def _gen_core_impl(
                 bkw["voice_clone_prompt"] = prompt
             if inst:
                 bkw["instruct"] = inst
+            raw = None
             try:
-                with MODEL_LOCK:
-                    outs = model.generate(**bkw)
-                out_parts.extend(
-                    np.asarray(a, dtype=np.float32).reshape(-1) for a in outs
-                )
+                raw = call_model(lambda: model.generate(**bkw), label="generate")
+                for a in raw:
+                    out_parts.append(_as_cpu_float(a))
                 i += bs
             except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
+                gpu_guard.free_cuda()
                 if bs == 1:
                     raise
                 bs = max(1, bs // 2)
                 log.warning("CUDA OOM -> reducing batch size to %d", bs)
+            finally:
+                # Named delete: deleting out of locals() looks like cleanup and
+                # does nothing at all.
+                del raw
         return out_parts
 
     t0 = time.perf_counter()
     try:
         if clone_prompt is not None or len(chunks) == 1:
-            # Clone mode, or a single chunk (instruct applies for design).
-            parts = _run_batches(chunks, clone_prompt, instruct_val, BATCH)
+            parts = _generate(chunks, clone_prompt, instruct_val, BATCH)
         else:
-            # Design mode + multiple chunks: synthesize the first chunk, lock the
-            # voice from its output, then batch the rest with that voice (Fix #44).
-            parts = _run_batches([chunks[0]], None, instruct_val, 1)
+            # Design mode + multiple chunks: lock the voice from the first
+            # chunk so the timbre cannot drift.
+            parts = _generate([chunks[0]], None, instruct_val, 1)
             try:
-                with MODEL_LOCK:
-                    clone_prompt = model.create_voice_clone_prompt(
-                        ref_audio=(torch.from_numpy(parts[0]).float(), sampling_rate),
-                        ref_text=chunks[0],
-                    )
+                first = parts[0]
+                clone_prompt = call_model(
+                    lambda: model.create_voice_clone_prompt(
+                        ref_audio=(torch.from_numpy(first).float(), sampling_rate),
+                        ref_text=chunks[0]),
+                    label="clone_prompt")
             except Exception as e:
                 log.warning("Could not lock design voice across chunks: %s", e)
-            parts += _run_batches(chunks[1:], clone_prompt, None, BATCH)
+            parts += _generate(chunks[1:], clone_prompt, None, BATCH)
 
-        waveform_f = concat_audio(parts, sampling_rate)
+        # ---- did it say what it was sent? -------------------------------
+        if VERIFY and not duration_set:
+            parts = _verify_stage(
+                chunks, parts, rep,
+                regen=lambda t: _generate([t], clone_prompt, instruct_val, 1)[0],
+                cancel_check=cancel_check)
+
+        waveform_f, join_info = audio_fx.join_chunks(
+            parts, sampling_rate, gap_sec=GAP_SEC, level_match=LEVEL_MATCH,
+            tail_pad_sec=OUT_TAIL_PAD)
+        rep["join"] = join_info
     except _Cancelled:
         return None, "Cancelled"
     except Exception as e:
+        log.exception("generation failed")
         return None, f"Error: {type(e).__name__}: {e}"
+    finally:
+        gpu_guard.free_cuda()
 
     gen_time = time.perf_counter() - t0
+    _bump("generations")
 
     if len(chunks) > 1:
         notes.append(f"{len(chunks)} chunks" + (f", batch {BATCH}" if BATCH > 1 else ""))
 
-    # RTF (real-time factor) = compute time / audio duration. Lower is faster;
-    # < 1.0 means faster than real time.
+    # ---- loudness -------------------------------------------------------
+    if NORMALIZE_OUTPUT and len(waveform_f):
+        waveform_f, loud = audio_fx.normalize_loudness(
+            waveform_f, sampling_rate, target_lufs=OUT_TARGET_LUFS,
+            peak_ceiling_db=OUT_PEAK_CEILING)
+        rep["loudness"] = loud
+        notes.append(f"{loud['out_lufs']:.1f} LUFS")
+        if not loud.get("met_target"):
+            why = {
+                "peak_ceiling": "the peak ceiling was reached first",
+                "gain_cap": "the source was too quiet to lift safely without "
+                            "raising its background noise",
+                "silence": "there was almost no signal to measure",
+            }.get(loud.get("limited_by"), "the target could not be reached")
+            warnings.append(
+                f"loudness came out at {loud['out_lufs']:.1f} LUFS instead of "
+                f"{OUT_TARGET_LUFS:.0f} — {why}")
+    else:
+        rep["loudness"] = {"in_lufs": round(audio_fx.lufs(waveform_f, sampling_rate), 2)}
+
+    join_info = rep.get("join") or {}
     audio_dur = len(waveform_f) / sampling_rate if sampling_rate else 0.0
     rtf = (gen_time / audio_dur) if audio_dur > 0 else 0.0
-    notes.append(f"{gen_time:.1f}s for {audio_dur:.1f}s audio · RTF {rtf:.3f}")
+    spoken_words = textnorm.word_count(syn_text)
+    # Rate is measured over speech, not over the trailing padding we added.
+    measured_wpm = audio_fx.wpm(spoken_words,
+                                join_info.get("speech_sec") or audio_dur)
+    corrections = [c for c in join_info.get("level_corrections", []) if c]
+    if corrections:
+        notes.append(f"levelled {len(corrections)} chunk(s) "
+                     f"(max {max(abs(c) for c in corrections):.1f} dB)")
 
-    waveform = (np.clip(waveform_f, -1.0, 1.0) * 32767).astype(np.int16)
+    rep.update({
+        "gen_sec": round(gen_time, 2), "audio_sec": round(audio_dur, 2),
+        "rtf": round(rtf, 3), "wpm": measured_wpm, "words": spoken_words,
+        "baseline_wpm": baseline_wpm,
+    })
+    # Speaking rate is a metric, never a gate: a documentary narrator runs ~100
+    # wpm and an ads voice ~210, so any fixed band both rejects good clips and
+    # passes broken ones. Compared against its own voice, it means something.
+    rate_note = verify.rate_warning(measured_wpm, baseline_wpm)
+    if rate_note:
+        warnings.append(rate_note)
+    if join_info.get("ends_abruptly"):
+        warnings.append("the clip ends at full volume — it may have been cut short")
+
+    notes.append(f"{gen_time:.1f}s for {audio_dur:.1f}s audio · RTF {rtf:.3f}"
+                 f" · {measured_wpm:.0f} wpm")
+
+    if WATERMARK and len(waveform_f):
+        # Generated audio only. A customer's own recording is their real voice
+        # and must never be stamped as synthetic.
+        waveform_f, wm = watermark.embed(waveform_f, sampling_rate,
+                                         alpha=WATERMARK_ALPHA)
+        rep["watermark"] = wm
+        if wm.get("watermarked"):
+            notes.append("watermarked")
+        elif wm.get("error"):
+            warnings.append(f"this clip is NOT watermarked: {wm['error']}")
+
+    waveform = audio_fx.to_int16(waveform_f)
     status = "Done. (" + "; ".join(notes) + ")"
+    if warnings:
+        status += " ⚠ " + "; ".join(warnings)
     return (sampling_rate, waveform), status
+
+
+def _as_cpu_float(a) -> np.ndarray:
+    """Get a result off the GPU immediately. A CUDA tensor parked in the jobs
+    dict keeps its whole allocation alive for as long as the entry exists."""
+    if torch is not None and isinstance(a, torch.Tensor):
+        a = a.detach().to("cpu", copy=True).float().numpy()
+    return np.asarray(a, dtype=np.float32).reshape(-1)
+
+
+def _verify_stage(chunks, parts, rep, regen, cancel_check=None):
+    """Screen the whole clip in one ASR pass; drill into chunks only on failure.
+
+    Verification is by far the biggest cost this wrapper adds, and RTF is the
+    number the product gets judged on. One pass over the finished clip answers
+    "did it say what it was sent?" for the common case — which is a clean job.
+    Per-chunk passes buy *locality*, and locality is only worth paying for once
+    something is actually wrong.
+
+    A five-chunk job goes from five extra ASR passes to one.
+    """
+    if VERIFY_MODE == "strict" or len(chunks) <= 1:
+        return _verify_and_repair(chunks, parts, rep, regen, cancel_check)
+
+    started = time.perf_counter()
+    screen, _info = audio_fx.join_chunks(parts, sampling_rate, gap_sec=GAP_SEC,
+                                         level_match=False, tail_pad_sec=0.0)
+    try:
+        heard = _transcribe_audio(screen, sampling_rate)
+    except Exception as e:  # noqa: BLE001
+        log.warning("verification screen failed: %s", e)
+        _bump("verify_skipped")
+        rep["warnings"].append("this clip could not be verified")
+        rep["verified"] = False
+        return parts
+    finally:
+        del screen
+
+    diff = verify.word_diff(" ".join(chunks), heard)
+    rep["verify_passes"] = 1
+    if verify.passed(diff):
+        rep["verified"] = True
+        rep["verify_mode"] = "whole-clip"
+        rep["verify_sec"] = round(time.perf_counter() - started, 2)
+        rep["word_accuracy"] = diff["word_accuracy"]
+        return parts
+
+    # Something is wrong. Now it is worth finding out exactly where.
+    log.info("whole-clip check failed (%s) — checking each chunk",
+             verify.describe(diff))
+    rep["verify_mode"] = "per-chunk"
+    out = _verify_and_repair(chunks, parts, rep, regen, cancel_check)
+    rep["verify_passes"] = 1 + len(chunks)
+    rep["verify_sec"] = round(time.perf_counter() - started, 2)
+    return out
+
+
+def _verify_and_repair(chunks, parts, rep, regen, cancel_check=None):
+    """Transcribe each chunk back, diff it against the script, and fix what can
+    be fixed.
+
+    Two failure shapes, two answers:
+      * extra words *after* the script (reference bleed) -> cut the trailing
+        artefact, which is cheap and leaves the real speech untouched;
+      * words missing (repetition collapse) -> regenerate the chunk, because
+        no amount of editing puts back something that was never said.
+
+    The verifier has a time budget. If it runs out the audio still goes out,
+    marked unverified — a checker must never become the reason a customer's
+    batch stalls.
+    """
+    started = time.perf_counter()
+    checked = 0
+    problems: List[str] = []
+    out = list(parts)
+    for idx, (chunk, wave) in enumerate(zip(chunks, parts)):
+        if cancel_check and cancel_check():
+            raise _Cancelled()
+        if time.perf_counter() - started > VERIFY_BUDGET_S:
+            _bump("verify_skipped")
+            rep["warnings"].append(
+                "verification ran out of time — this clip was not checked")
+            rep["verified"] = False
+            return out
+        try:
+            heard = _transcribe_audio(wave, sampling_rate)
+        except Exception as e:  # noqa: BLE001
+            log.warning("verification transcription failed: %s", e)
+            _bump("verify_skipped")
+            rep["warnings"].append("this clip could not be verified")
+            rep["verified"] = False
+            return out
+        diff = verify.word_diff(chunk, heard)
+        checked += 1
+
+        # First, the cheap repair: if the ONLY problem is words after the end of
+        # the script, cut the artefact. The real speech is untouched, and it
+        # costs nothing next to a re-generation.
+        repaired = False
+        if verify.only_tail_is_wrong(diff):
+            fixed, removed = audio_fx.remove_tail_after_gap(wave, sampling_rate)
+            if removed:
+                _bump("tail_trims")
+                log.info("trimmed %.2fs of leaked reference audio from chunk %d "
+                         "(%s)", removed, idx + 1, " ".join(diff["tail_inserted"]))
+                wave, out[idx], repaired = fixed, fixed, True
+                problems.append(
+                    f"removed {removed:.1f}s of leftover reference audio "
+                    f"(\"{' '.join(diff['tail_inserted'][:4])}\")")
+
+        # Then the expensive one: words that were never spoken cannot be edited
+        # back in, so the chunk has to be made again.
+        attempts = 0
+        while not repaired and not verify.passed(diff) and attempts < VERIFY_RETRIES:
+            _bump("regenerations")
+            attempts += 1
+            try:
+                candidate = regen(chunk)
+            except Exception as e:  # noqa: BLE001
+                log.warning("regeneration failed: %s", e)
+                break
+            try:
+                heard2 = _transcribe_audio(candidate, sampling_rate)
+            except Exception:  # noqa: BLE001
+                break
+            diff2 = verify.word_diff(chunk, heard2)
+            better = (len(diff2["hard_dropped"]) + len(diff2["hard_inserted"])
+                      < len(diff["hard_dropped"]) + len(diff["hard_inserted"]))
+            if better:
+                wave, diff = candidate, diff2
+                out[idx] = candidate
+            if verify.passed(diff):
+                break
+            if verify.only_tail_is_wrong(diff):
+                fixed, removed = audio_fx.remove_tail_after_gap(wave, sampling_rate)
+                if removed:
+                    _bump("tail_trims")
+                    wave, out[idx], repaired = fixed, fixed, True
+                    problems.append(
+                        f"removed {removed:.1f}s of leftover reference audio "
+                        f"(\"{' '.join(diff['tail_inserted'][:4])}\")")
+
+        if not repaired and not verify.passed(diff):
+            _bump("verify_failures")
+            problems.append(f"chunk {idx + 1}: {verify.describe(diff)}")
+            rep.setdefault("diffs", []).append(
+                {"chunk": idx + 1, "dropped": diff["hard_dropped"],
+                 "inserted": diff["hard_inserted"],
+                 "word_accuracy": diff["word_accuracy"]})
+
+    rep["verified"] = checked > 0
+    rep["verify_sec"] = round(time.perf_counter() - started, 2)
+    if problems:
+        rep["warnings"].extend(problems)
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Auto-transcribe reference audio on upload (fills the Reference Text box).
-# Combines Fix #1 (trim to <=MAX_REF_SEC) with multilingual Whisper ASR so the
-# user sees and can edit the transcript before generating.
 # ---------------------------------------------------------------------------
 def transcribe_reference(ref_audio):
     if not ref_audio:
         return "", "Upload a reference clip — it will be auto-transcribed here."
-    ref_path, dur, trimmed = trim_reference(ref_audio)
+    ref_path, info = prepare_reference(ref_audio)
     try:
-        with MODEL_LOCK:
-            text = model.transcribe(ref_path)
+        text = _transcribe_path(ref_path)
     except Exception as e:
         return "", f"Auto-transcribe failed: {type(e).__name__}: {e}"
+    dur = info.get("cut_sec") or info.get("duration_sec")
     msg = f"Transcribed ~{dur:.1f}s reference." if dur else "Transcribed reference."
-    if trimmed:
-        msg += f" Using first {MAX_REF_SEC:.0f}s for cloning."
-    elif dur is not None and dur < 3:
-        msg += " Warning: < 3s may reduce quality."
+    if info.get("warnings"):
+        msg += " ⚠ " + " ".join(info["warnings"])
     return text, msg
 
 
@@ -531,9 +928,7 @@ def transcribe_reference(ref_audio):
 # ---------------------------------------------------------------------------
 OUTPUT_DIR = os.environ.get("OMNIVOICE_OUTPUT_DIR", os.path.join(_HERE, "outputs"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-# Live save folder (user-changeable in the UI). Voices auto-save here.
 _OUT_DIR = OUTPUT_DIR
-# Shut-down-on-complete toggle.
 _SHUTDOWN = {"on": False, "fired": False}
 
 JOBS = []  # list of dicts: id, project, status, info, file, params
@@ -550,7 +945,11 @@ def set_output_dir(path):
     try:
         os.makedirs(p, exist_ok=True)
         _OUT_DIR = p
-        return f"📂 Voices will auto-save to: {p}"
+        extra = ""
+        if os.path.normpath(p) != os.path.normpath(OUTPUT_DIR):
+            extra = ("  ·  files save here on disk; in-browser downloads only "
+                     "work for folders listed in OMNIVOICE_ALLOWED_PATHS")
+        return f"📂 Voices will auto-save to: {p}{extra}"
     except Exception as e:
         return f"❌ Can't use that folder: {e}"
 
@@ -559,8 +958,16 @@ def set_shutdown(on):
     _SHUTDOWN["on"] = bool(on)
     _SHUTDOWN["fired"] = False
     return ("🛑 PC will shut down ~60s after the queue finishes "
-            "(run `shutdown /a` in CMD to cancel)." if on
+            "(cancel with `shutdown /a` on Windows)." if on
             else "Shutdown-on-complete is OFF.")
+
+
+def _shutdown_command() -> Optional[str]:
+    if sys.platform.startswith("win"):
+        return 'shutdown /s /t 60 /c "OmniVoice: queue complete"'
+    if sys.platform == "darwin":
+        return "sudo shutdown -h +1"
+    return "shutdown -h +1"
 
 
 def _maybe_shutdown():
@@ -571,9 +978,10 @@ def _maybe_shutdown():
                       for j in JOBS)
     if not pending:
         _SHUTDOWN["fired"] = True
-        log.warning("Queue complete -> shutting down in 60s. Cancel: shutdown /a")
+        cmd = _shutdown_command()
+        log.warning("Queue complete -> shutting down in 60s (%s)", cmd)
         try:
-            os.system('shutdown /s /t 60 /c "OmniVoice: queue complete"')
+            os.system(cmd)
         except Exception as e:  # noqa: BLE001
             log.warning("shutdown command failed: %s", e)
 
@@ -622,18 +1030,23 @@ def _worker_loop():
             p = job["params"]
             prebuilt = p.get("clone_prompt")
             mode = "clone" if (p.get("ref_audio") or prebuilt) else "design"
-            out, status = _gen_core(
-                p.get("script", ""), p.get("language"), p.get("ref_audio"),
-                p.get("instruct"),
-                p.get("num_step", 16), p.get("guidance_scale", 2.0),
-                p.get("denoise", True),
-                p.get("speed", 1.0), p.get("duration"),
-                p.get("preprocess", True), p.get("postprocess", True),
-                mode=mode, ref_text=p.get("ref_text"),
-                cancel_check=lambda jid=job_id: _is_cancelled(jid),
-                prebuilt_prompt=prebuilt,
-            )
+            rep: Dict[str, Any] = {}
+            with GEN_SLOTS:
+                out, status = _gen_core(
+                    p.get("script", ""), p.get("language"), p.get("ref_audio"),
+                    p.get("instruct"),
+                    p.get("num_step", 16), p.get("guidance_scale", 2.0),
+                    p.get("denoise", True),
+                    p.get("speed", 1.0), p.get("duration"),
+                    p.get("preprocess", True), p.get("postprocess", True),
+                    mode=mode, ref_text=p.get("ref_text"),
+                    cancel_check=lambda jid=job_id: _is_cancelled(jid),
+                    prebuilt_prompt=prebuilt, report=rep,
+                    seed=p.get("seed"), baseline_wpm=p.get("baseline_wpm"),
+                )
             with JOBS_LOCK:
+                job["report"] = rep
+                job["warnings"] = rep.get("warnings", [])
                 if status == "Cancelled":
                     job["status"], job["info"] = "Cancelled", ""
                 elif out is None:
@@ -643,9 +1056,16 @@ def _worker_loop():
                     path = _unique_output_path(job["project"])
                     sf.write(path, wav, sr)
                     job["status"] = "Done"
-                    job["info"] = status.replace("Done. ", "").strip("() ")
+                    job["info"] = (status.split(" ⚠ ")[0]
+                                   .replace("Done. ", "").strip("() "))
                     job["file"] = path
+                    audit_generation(p.get("script", ""), rep,
+                                     voice_id=p.get("voice_id"),
+                                     owner=p.get("owner"),
+                                     project=job["project"], wav=wav, sr=sr,
+                                     source="queue")
         except Exception as e:  # noqa: BLE001 - keep the worker alive
+            log.exception("worker failed on job %s", job_id)
             with JOBS_LOCK:
                 job = _find_job(job_id)
                 if job is not None:
@@ -672,8 +1092,6 @@ _BADGE_CLASS = {
 def _download_files():
     with JOBS_LOCK:
         files = [j["file"] for j in JOBS if j["status"] == "Done" and j["file"]]
-    # Only surface files that still exist — a moved/deleted output must never
-    # break the queue UI (gr.Files errors on missing paths otherwise).
     return [f for f in files if os.path.exists(f)]
 
 
@@ -686,6 +1104,21 @@ def _picker_update(cur=None):
     choices = _job_choices()
     valid = cur if (cur is not None and any(v == cur for _, v in choices)) else None
     return gr.update(choices=choices, value=valid)
+
+
+def _gpu_line() -> str:
+    snap = gpu_guard.snapshot()
+    if snap.get("device") != "cuda":
+        return '<div class="vq-gpu">CPU mode — generation will be slow.</div>'
+    bits = [f"{snap.get('name', 'GPU')}"]
+    if "free_mb" in snap and "total_mb" in snap:
+        used = snap["total_mb"] - snap["free_mb"]
+        bits.append(f"VRAM {used:.0f} / {snap['total_mb']:.0f} MB")
+    if snap.get("fragmentation_mb", 0) > 512:
+        bits.append(f"⚠ {snap['fragmentation_mb']:.0f} MB fragmented")
+    if not HEALTH.ok:
+        bits.append("⚠ generation is failing — restart the app")
+    return '<div class="vq-gpu">' + html_mod.escape(" · ".join(bits)) + "</div>"
 
 
 def _jobs_html():
@@ -701,7 +1134,7 @@ def _jobs_html():
         f'<span class="vq-pill">{ico} {counts.get(st, 0)} {st}</span>'
         for st, ico in pill_defs
     )
-    header = f'<div class="vq-pills">{pills}</div>'
+    header = f'<div class="vq-pills">{pills}</div>' + _gpu_line()
 
     if not jobs:
         return header + ('<div class="vq-empty">🎙️ No projects yet — fill the form '
@@ -717,13 +1150,17 @@ def _jobs_html():
         script_preview = html_mod.escape((j["params"]["script"] or "")[:60])
         cloned = bool(j["params"].get("clone_prompt"))
         voice = "🎤 cloned" if cloned else "🎛️ designed"
-        # Sub-line: voice + (timing/RTF once done, else a script preview).
         detail = info if info else (f"{script_preview}…" if script_preview else "")
         sub = f"{voice} · {detail}" if detail else voice
-        # Voice transcript actually used for the clone (so you can verify it).
         ref_used = html_mod.escape((j.get("ref_used") or "")[:60])
         ref_line = (f'<div class="vq-ref">🗣️ voice: "{ref_used}…"</div>'
                     if ref_used else "")
+        warn_line = ""
+        if j.get("warnings"):
+            txt = html_mod.escape("; ".join(j["warnings"])[:220])
+            warn_line = f'<div class="vq-warn">⚠ {txt}</div>'
+        elif status == "Done" and (j.get("report") or {}).get("verified"):
+            warn_line = '<div class="vq-good">✓ checked against your script</div>'
         dl = ""
         if status == "Done" and j["file"]:
             fname = html_mod.escape(os.path.basename(j["file"]))
@@ -733,7 +1170,7 @@ def _jobs_html():
             f'<div class="vq-left">'
             f'<span class="vq-id">#{j["id"]}</span>'
             f'<div class="vq-meta"><div class="vq-name">{name}</div>'
-            f'<div class="vq-sub">{sub}</div>{ref_line}{dl}</div>'
+            f'<div class="vq-sub">{sub}</div>{ref_line}{warn_line}{dl}</div>'
             f'</div>'
             f'<div class="vq-right">'
             f'<span class="vq-badge {cls}">{icon} {status}</span>'
@@ -746,19 +1183,96 @@ def _ui_state(msg="", cur=None):
     return _jobs_html(), _download_files(), _picker_update(cur), msg
 
 
+# ---------------------------------------------------------------------------
+# Voice library — save a clone under a name, reuse it later (UI + API share it).
+# ---------------------------------------------------------------------------
+VOICES_DIR = os.environ.get("OMNIVOICE_VOICES_DIR", os.path.join(_HERE, "voices"))
+os.makedirs(VOICES_DIR, exist_ok=True)
+VOICES_INDEX = os.path.join(VOICES_DIR, "index.json")
+VOICES: Dict[str, Dict[str, Any]] = {}
+VOICES_LOCK = threading.Lock()
+NO_SAVED_VOICE = "— none —"
+
+_PERSISTED_VOICE_FIELDS = ("path", "ref_text", "baseline_wpm", "quality_score",
+                           "warnings", "owner", "created", "duration_sec",
+                           "lufs", "snr_db",
+                           # Who this voice belongs to and on what authority.
+                           # Consent is the deciding factor in every framework
+                           # that now covers voice cloning, and it has to live
+                           # with the voice, not in somebody's inbox.
+                           "speaker_name", "consent", "consent_ref")
+
+
+def _save_voice_index():
+    with VOICES_LOCK:
+        data = {n: {k: v.get(k) for k in _PERSISTED_VOICE_FIELDS if k in v}
+                for n, v in VOICES.items()}
+    tmp = VOICES_INDEX + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, VOICES_INDEX)     # atomic: a crash never truncates it
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not write voices index: %s", e)
+
+
+def _load_voice_index():
+    """Voices must survive a restart — an OOM restart that loses every
+    customer's voice_id breaks every client at once."""
+    if not os.path.exists(VOICES_INDEX):
+        return
+    try:
+        with open(VOICES_INDEX, encoding="utf-8") as f:
+            data = json.load(f)
+        for name, meta in data.items():
+            p = meta.get("path")
+            if p and os.path.exists(p):
+                entry = {k: meta.get(k) for k in _PERSISTED_VOICE_FIELDS
+                         if k in meta}
+                entry.setdefault("ref_text", "")
+                entry["path"] = p
+                entry["prompt"] = None          # rebuilt lazily on first use
+                VOICES[name] = entry
+            else:
+                log.warning("voice '%s' points at a missing file (%s) — skipped",
+                            name, p)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not load voices index: %s", e)
+
+
+def _invalidate_voice_prompts():
+    """After a model reload the cached prompts belong to tensors that no longer
+    exist. Drop them; they rebuild from the stored clips."""
+    with VOICES_LOCK:
+        for v in VOICES.values():
+            v["prompt"] = None
+    _VOICE_CACHE.update(key=None, prompt=None, ref_text="")
+
+
+def _unique_voice_name(base):
+    base = _safe_name(base)
+    with VOICES_LOCK:
+        existing = set(VOICES.keys())
+    if base not in existing:
+        return base
+    i = 2
+    while f"{base}_{i}" in existing:
+        i += 1
+    return f"{base}_{i}"
+
+
 def _build_prompt(ref_audio, ref_text):
     """Build a voice clone prompt now and return (prompt, transcript_used)."""
-    ref_path, _, _ = trim_reference(ref_audio)
-    with MODEL_LOCK:
-        p = model.create_voice_clone_prompt(
-            ref_audio=ref_path, ref_text=(ref_text or None),
-        )
-    return p, (p.ref_text or "")
+    ref_path, _info = prepare_reference(ref_audio)
+    p = call_model(
+        lambda: model.create_voice_clone_prompt(ref_audio=ref_path,
+                                                ref_text=(ref_text or None)),
+        label="clone_prompt")
+    return p, (getattr(p, "ref_text", "") or "")
 
 
 # Cache the last-built voice so adding many scripts with the SAME clip does not
-# re-transcribe / re-encode each time. Rebuilds only when the clip (or its
-# transcript) changes.
+# re-transcribe / re-encode each time.
 _VOICE_CACHE = {"key": None, "prompt": None, "ref_text": ""}
 
 
@@ -771,75 +1285,112 @@ def _get_or_build_prompt(ref_audio, ref_text):
     return prompt, used
 
 
-# ---------------------------------------------------------------------------
-# Voice library — save a clone under a name, reuse it later (UI + API share it).
-# Clips are stored in voices/, an index.json survives restarts. Prompts are
-# built lazily (transcribe/encode once) and cached.
-# ---------------------------------------------------------------------------
-VOICES_DIR = os.path.join(_HERE, "voices")
-os.makedirs(VOICES_DIR, exist_ok=True)
-VOICES_INDEX = os.path.join(VOICES_DIR, "index.json")
-VOICES = {}  # name -> {"path": wav, "ref_text": str, "prompt": VoiceClonePrompt|None}
-VOICES_LOCK = threading.Lock()
-NO_SAVED_VOICE = "— none —"
+class ReferenceRejected(ValueError):
+    """The uploaded reference cannot be used, and the caller is told why."""
 
 
-def _save_voice_index():
-    with VOICES_LOCK:
-        data = {n: {"path": v["path"], "ref_text": v.get("ref_text", "")}
-                for n, v in VOICES.items()}
-    try:
-        with open(VOICES_INDEX, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Could not write voices index: %s", e)
+def save_voice(name, audio_path, ref_text=None, owner=None, consent=None,
+               consent_ref=None, speaker_name=None) -> Tuple[str, Dict]:
+    """Register a voice: repair the clip, level it, check the transcript really
+    matches the audio, and store a baseline speaking rate.
 
+    Returns (voice_id, report). Never overwrites an existing voice.
 
-def _load_voice_index():
-    if not os.path.exists(VOICES_INDEX):
-        return
-    try:
-        with open(VOICES_INDEX, encoding="utf-8") as f:
-            data = json.load(f)
-        for name, meta in data.items():
-            p = meta.get("path")
-            if p and os.path.exists(p):
-                VOICES[name] = {"path": p, "ref_text": meta.get("ref_text", ""),
-                                "prompt": None}
-    except Exception as e:  # noqa: BLE001
-        log.warning("Could not load voices index: %s", e)
-
-
-def _unique_voice_name(base):
-    """Never overwrite an existing voice — return a fresh unique name."""
-    base = _safe_name(base)
-    with VOICES_LOCK:
-        existing = set(VOICES.keys())
-    if base not in existing:
-        return base
-    i = 2
-    while f"{base}_{i}" in existing:
-        i += 1
-    return f"{base}_{i}"
-
-
-def save_voice(name, audio_path, ref_text=None):
-    """Save the current clip under a UNIQUE name (trimmed to <=MAX_REF_SEC).
-    Returns (voice_name, transcript). Never overwrites an existing voice."""
+    The transcript check is the important one. Reference bleed — reference words
+    turning up in generated clips — happens when the model is told one thing and
+    hears another, so it treats the difference as something it is supposed to
+    say. Catching that here turns a bug that surfaces three hours into a batch
+    into a message at upload time.
+    """
     if not audio_path:
-        raise ValueError("no audio to save")
+        raise ReferenceRejected("no audio to save")
+    if REQUIRE_CONSENT and not consent:
+        raise ReferenceRejected(
+            "this server requires proof of consent before a voice can be "
+            "registered: send consent=true and consent_ref=<your record id or "
+            "URL>. Cloning an identifiable voice without documented, explicit "
+            "permission is unlawful in a growing number of places, and the "
+            "record has to name the commercial use it covers.")
+
+    x, sr = read_audio(audio_path)
+    report = audio_fx.analyze_reference(x, sr, max_sec=MAX_REF_SEC * 3)
+    y, trim_info = audio_fx.smart_trim_reference(
+        x, sr, max_sec=MAX_REF_SEC, tail_silence_sec=REF_TAIL_SILENCE,
+        min_keep_sec=REF_MIN_KEEP_SEC, hard_max_sec=REF_HARD_MAX_SEC)
+    warnings = _merge_ref_warnings(report, trim_info)
+    y, loud = audio_fx.normalize_loudness(
+        y, sr, target_lufs=REF_TARGET_LUFS, peak_ceiling_db=OUT_PEAK_CEILING)
+
     name = _unique_voice_name(name)
-    ref_path, _dur, _trim = trim_reference(audio_path)  # cut at MAX_REF_SEC (10s)
     dst = os.path.join(VOICES_DIR, name + ".wav")
+    write_wav(dst, y, sr)
+    duration = len(y) / float(sr)
+
+    heard = ""
     try:
-        shutil.copyfile(ref_path, dst)
-    except Exception:
-        dst = ref_path  # fall back to the (temp) trimmed file
-    prompt, ref_used = _build_prompt(dst, ref_text)
+        heard = _transcribe_path(dst)
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not transcribe reference for '%s': %s", name, e)
+
+    supplied = (ref_text or "").strip()
+    used_text = heard
+    if supplied:
+        if trim_info.get("trimmed"):
+            warnings.append(
+                "your reference transcript was replaced by a transcript of the "
+                "trimmed clip — the upload was longer than "
+                f"{MAX_REF_SEC:.0f}s, so the text no longer matched the audio")
+        elif heard:
+            m = verify.reference_matches_audio(supplied, heard)
+            if m["matches"]:
+                used_text = supplied
+            else:
+                detail = (f"the transcript you sent matches only "
+                          f"{m['word_accuracy']:.0%} of what the recording "
+                          f"actually says")
+                if STRICT_REF:
+                    try:
+                        os.remove(dst)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise ReferenceRejected(
+                        detail + ". A transcript that does not match the audio is "
+                        "the main cause of reference words leaking into every "
+                        "generated clip. Send the correct text, or omit ref_text "
+                        "and it will be transcribed for you. "
+                        f"Heard: \"{heard[:160]}\"")
+                warnings.append(detail + " — the transcribed text was used instead")
+        else:
+            used_text = supplied
+
+    baseline = verify.baseline_wpm(used_text, duration)
+    entry = {
+        "path": dst, "ref_text": used_text, "prompt": None,
+        "baseline_wpm": baseline,
+        "quality_score": report.get("quality_score"),
+        "warnings": warnings, "owner": owner,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "duration_sec": round(duration, 2),
+        "lufs": loud.get("out_lufs"), "snr_db": report.get("snr_db"),
+        "speaker_name": speaker_name,
+        "consent": bool(consent) if consent is not None else None,
+        "consent_ref": consent_ref,
+    }
     with VOICES_LOCK:
-        VOICES[name] = {"path": dst, "ref_text": ref_used, "prompt": prompt}
+        VOICES[name] = entry
     _save_voice_index()
-    return name, ref_used
+    audit("voice_registered", voice_id=name, tenant=owner,
+          speaker_name=speaker_name, consent=entry["consent"],
+          consent_ref=consent_ref, duration_sec=entry["duration_sec"],
+          quality_score=report.get("quality_score"),
+          warnings=(warnings or None))
+
+    report.update({"voice_id": name, "accepted": True, "ref_text": used_text,
+                   "baseline_wpm": baseline, "warnings": warnings,
+                   "duration_sec": round(duration, 2),
+                   "loudness": loud, "trim": trim_info,
+                   "hint": "docs/reference_playbook.md"})
+    return name, report
 
 
 def get_voice_prompt(name):
@@ -852,21 +1403,37 @@ def get_voice_prompt(name):
         prompt, ref_used = _build_prompt(v["path"], v.get("ref_text") or None)
         with VOICES_LOCK:
             v["prompt"] = prompt
-            v["ref_text"] = ref_used
+            if not v.get("ref_text"):
+                v["ref_text"] = ref_used
     return v["prompt"], v.get("ref_text", "")
 
 
-def list_voice_names():
+def voice_baseline(name) -> Optional[float]:
     with VOICES_LOCK:
-        return sorted(VOICES.keys())
+        v = VOICES.get(name) or {}
+    return v.get("baseline_wpm")
 
 
-def delete_voice(name):
-    """Remove a saved voice (its clip + index entry). Returns True if deleted."""
+def list_voice_names(owner=None):
     with VOICES_LOCK:
-        v = VOICES.pop(name, None)
-    if not v:
-        return False
+        return sorted(n for n, v in VOICES.items()
+                      if owner is None or v.get("owner") in (None, owner))
+
+
+def voice_exists(name, owner=None) -> bool:
+    with VOICES_LOCK:
+        v = VOICES.get(name)
+    # A voice belonging to another tenant reports as missing, not forbidden:
+    # 403 would confirm that the id exists.
+    return bool(v and (owner is None or v.get("owner") in (None, owner)))
+
+
+def delete_voice(name, owner=None):
+    with VOICES_LOCK:
+        v = VOICES.get(name)
+        if not v or (owner is not None and v.get("owner") not in (None, owner)):
+            return False
+        VOICES.pop(name, None)
     try:
         p = v.get("path")
         if p and os.path.exists(p) and os.path.normpath(
@@ -879,7 +1446,6 @@ def delete_voice(name):
 
 
 def voice_details(name):
-    """Return (clip_path, transcript) for a saved voice, or (None, '')."""
     with VOICES_LOCK:
         v = VOICES.get(name)
     if not v:
@@ -887,9 +1453,21 @@ def voice_details(name):
     return v.get("path"), v.get("ref_text", "")
 
 
+def voice_public(name) -> Dict:
+    with VOICES_LOCK:
+        v = dict(VOICES.get(name) or {})
+    v.pop("prompt", None)
+    v.pop("path", None)
+    v["voice_id"] = name
+    return v
+
+
 _load_voice_index()
 
 
+# ---------------------------------------------------------------------------
+# UI handlers
+# ---------------------------------------------------------------------------
 def save_voice_ui(name, ref_audio):
     """UI handler: save the uploaded clip to the permanent library."""
     if not ref_audio:
@@ -898,14 +1476,20 @@ def save_voice_ui(name, ref_audio):
         return gr.update(), "⚠️ Type a name for the voice, then Save."
     wanted = _safe_name(name)
     try:
-        vid, ref_used = save_voice(name, ref_audio)
+        vid, rep = save_voice(name, ref_audio)
+    except ReferenceRejected as e:
+        return gr.update(), f"❌ {e}"
     except Exception as e:  # noqa: BLE001
         return gr.update(), f"❌ Save failed: {type(e).__name__}: {e}"
     choices = [NO_SAVED_VOICE] + list_voice_names()
     note = (f" (name '{wanted}' was taken)" if vid != wanted else "")
-    return (gr.update(choices=choices, value=vid),
-            f"💾 Your unique voice name is **{vid}**{note} — reusable from the "
-            "dropdown & API. It's saved permanently.")
+    msg = (f"💾 Your unique voice name is **{vid}**{note} — reusable from the "
+           f"dropdown & API. It's saved permanently.")
+    if rep.get("baseline_wpm"):
+        msg += f"  ·  natural rate ≈ {rep['baseline_wpm']:.0f} wpm"
+    if rep.get("warnings"):
+        msg += "\n\n⚠️ " + "\n⚠️ ".join(rep["warnings"])
+    return gr.update(choices=choices, value=vid), msg
 
 
 def refresh_voice_dropdown():
@@ -937,24 +1521,21 @@ def delete_voice_ui(name):
 
 
 def _resolve_ui_voice(saved_voice, ref_audio, ref_text):
-    """Prefer a saved-library voice; else the uploaded clip; else designed."""
+    """Prefer a saved-library voice; else the uploaded clip; else designed.
+    Returns (prompt, transcript, baseline_wpm)."""
     if saved_voice and saved_voice != NO_SAVED_VOICE:
-        return get_voice_prompt(saved_voice)
+        if not voice_exists(saved_voice):
+            raise KeyError(f"voice '{saved_voice}' no longer exists")
+        prompt, used = get_voice_prompt(saved_voice)
+        return prompt, used, voice_baseline(saved_voice)
     if ref_audio:
-        return _get_or_build_prompt(ref_audio, ref_text)
-    return None, ""
+        prompt, used = _get_or_build_prompt(ref_audio, ref_text)
+        return prompt, used, None
+    return None, "", None
 
 
-def add_job(project, script, ref_audio, ref_text, language, num_step,
-            guidance_scale=2.0, denoise=True, speed=1.0, duration=None,
-            preprocess=True, postprocess=True, saved_voice=None):
+def _new_job(project, script, prebuilt, ref_used, params) -> int:
     global _JOB_SEQ
-    if not script or not script.strip():
-        return _ui_state("⚠️ Script is empty — nothing added.")
-    try:
-        prebuilt, ref_used = _resolve_ui_voice(saved_voice, ref_audio, ref_text)
-    except Exception as e:
-        return _ui_state(f"❌ Voice prompt failed: {type(e).__name__}: {e}")
     with JOBS_LOCK:
         _JOB_SEQ += 1
         jid = _JOB_SEQ
@@ -962,19 +1543,38 @@ def add_job(project, script, ref_audio, ref_text, language, num_step,
         JOBS.append({
             "id": jid, "project": proj, "status": "Queued", "info": "",
             "file": None, "cancel": False, "ref_used": ref_used,
-            "params": {
-                "script": script, "ref_audio": None, "clone_prompt": prebuilt,
-                "ref_text": (ref_text or None), "language": language,
-                "num_step": int(num_step or 16),
-                "guidance_scale": float(guidance_scale),
-                "denoise": bool(denoise),
-                "speed": float(speed) if speed else 1.0,
-                "duration": (float(duration) if duration else None),
-                "preprocess": bool(preprocess),
-                "postprocess": bool(postprocess),
-            },
+            "warnings": [], "report": {},
+            "params": dict(params, script=script, clone_prompt=prebuilt),
         })
     JOB_Q.put(jid)
+    return jid
+
+
+def add_job(project, script, ref_audio, ref_text, language, num_step,
+            guidance_scale=2.0, denoise=True, speed=1.0, duration=None,
+            preprocess=True, postprocess=True, saved_voice=None):
+    if not script or not script.strip():
+        return _ui_state("⚠️ Script is empty — nothing added.")
+    too_big = check_input_size(script)
+    if too_big:
+        return _ui_state(f"⚠️ {too_big}")
+    try:
+        prebuilt, ref_used, baseline = _resolve_ui_voice(saved_voice, ref_audio, ref_text)
+    except Exception as e:
+        return _ui_state(f"❌ Voice prompt failed: {type(e).__name__}: {e}")
+    params = {
+        "ref_audio": None, "ref_text": (ref_text or None), "language": language,
+        "num_step": int(num_step or 16), "guidance_scale": float(guidance_scale),
+        "denoise": bool(denoise), "speed": float(speed) if speed else 1.0,
+        "duration": (float(duration) if duration else None),
+        "preprocess": bool(preprocess), "postprocess": bool(postprocess),
+        "baseline_wpm": baseline,
+        "voice_id": (saved_voice if saved_voice and saved_voice != NO_SAVED_VOICE
+                     else None),
+    }
+    jid = _new_job(project, script, prebuilt, ref_used, params)
+    with JOBS_LOCK:
+        proj = _find_job(jid)["project"]
     return _ui_state(f"✅ Added '{proj}' to the queue.")
 
 
@@ -983,7 +1583,6 @@ def _cell(v):
     if v is None:
         return ""
     try:
-        # NaN check (float('nan') != itself)
         if isinstance(v, float) and v != v:
             return ""
     except Exception:
@@ -997,20 +1596,16 @@ def _rows_to_list(rows):
     'data', numpy array, or a plain list — and return a list of row-lists."""
     if rows is None:
         return []
-    # pandas DataFrame
     try:
         import pandas as pd
         if isinstance(rows, pd.DataFrame):
             return rows.values.tolist()
     except Exception:
         pass
-    # dict form: {"headers": [...], "data": [[...], ...]}
     if isinstance(rows, dict):
         return rows.get("data") or rows.get("value") or []
-    # list / tuple
     if isinstance(rows, (list, tuple)):
         return list(rows)
-    # numpy array or anything with tolist()
     try:
         return rows.tolist()
     except Exception:
@@ -1052,10 +1647,8 @@ def add_table(rows, ref_audio, ref_text, language, num_step,
 
     All rows share the same (cached) voice. Empty-script rows are skipped.
     """
-    global _JOB_SEQ
-    data = _rows_to_list(rows)
     items = []
-    for r in data:
+    for r in _rows_to_list(rows):
         if r is None:
             continue
         if not isinstance(r, (list, tuple)):
@@ -1066,34 +1659,29 @@ def add_table(rows, ref_audio, ref_text, language, num_step,
             items.append((name, scr))
     if not items:
         return _ui_state("⚠️ Fill at least one row with a script.")
+    for _n, scr in items:
+        too_big = check_input_size(scr)
+        if too_big:
+            return _ui_state(f"⚠️ {too_big}")
 
     try:
-        prebuilt, ref_used = _resolve_ui_voice(saved_voice, ref_audio, ref_text)
+        prebuilt, ref_used, baseline = _resolve_ui_voice(saved_voice, ref_audio, ref_text)
     except Exception as e:
         return _ui_state(f"❌ Voice prompt failed: {type(e).__name__}: {e}")
 
-    new_ids = []
-    with JOBS_LOCK:
-        for name, scr in items:
-            _JOB_SEQ += 1
-            jid = _JOB_SEQ
-            proj = _safe_name(name) if name and name.lower() != "nan" else f"clip_{jid}"
-            JOBS.append({
-                "id": jid, "project": proj, "status": "Queued",
-                "info": "", "file": None, "cancel": False, "ref_used": ref_used,
-                "params": {
-                    "script": scr, "ref_audio": None, "clone_prompt": prebuilt,
-                    "ref_text": (ref_text or None), "language": language,
-                    "num_step": int(num_step or 16),
-                    "guidance_scale": float(guidance_scale), "denoise": bool(denoise),
-                    "speed": float(speed) if speed else 1.0,
-                    "duration": (float(duration) if duration else None),
-                    "preprocess": bool(preprocess), "postprocess": bool(postprocess),
-                },
-            })
-            new_ids.append(jid)
-    for jid in new_ids:
-        JOB_Q.put(jid)
+    params = {
+        "ref_audio": None, "ref_text": (ref_text or None), "language": language,
+        "num_step": int(num_step or 16), "guidance_scale": float(guidance_scale),
+        "denoise": bool(denoise), "speed": float(speed) if speed else 1.0,
+        "duration": (float(duration) if duration else None),
+        "preprocess": bool(preprocess), "postprocess": bool(postprocess),
+        "baseline_wpm": baseline,
+        "voice_id": (saved_voice if saved_voice and saved_voice != NO_SAVED_VOICE
+                     else None),
+    }
+    for name, scr in items:
+        proj = _safe_name(name) if name and name.lower() != "nan" else ""
+        _new_job(proj, scr, prebuilt, ref_used, params)
     return _ui_state(f"✅ Added {len(items)} projects to the queue (same voice).")
 
 
@@ -1140,6 +1728,8 @@ def zip_all():
     if not files:
         return None, "No completed files to download yet."
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Always written to OUTPUT_DIR: that folder is what launch() allows the
+    # browser to read, whatever the user set as the save folder.
     zip_path = os.path.join(OUTPUT_DIR, f"voiceover_all_{ts}.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for f in files:
@@ -1178,30 +1768,14 @@ def _lang_dropdown(label="Language (optional) / 语种 (可选)"):
     )
 
 
-def _gen_settings():
-    with gr.Accordion("Generation Settings (optional)", open=False):
-        sp = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label="Speed",
-                       info="1.0 = normal. Ignored if Duration is set.")
-        du = gr.Number(value=None, label="Duration (seconds)",
-                       info="Leave empty to use speed. Disables chunking.")
-        ns = gr.Slider(4, 64, value=16, step=1, label="Inference Steps",
-                       info="Default 16 (fast). Raise to 32+ for higher quality.")
-        dn = gr.Checkbox(label="Denoise", value=True)
-        gs = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="Guidance Scale (CFG)")
-        pp = gr.Checkbox(label="Preprocess Prompt", value=True,
-                         info="Silence removal/trim on reference audio.")
-        po = gr.Checkbox(label="Postprocess Output", value=True,
-                         info="Remove long silences from output.")
-    return ns, gs, dn, sp, du, pp, po
-
-
 def build_ui() -> gr.Blocks:
     # In Gradio 6, theme/css are passed to launch(), not the Blocks constructor.
     with gr.Blocks(title="OmniVoice Demo") as demo:
         gr.Markdown(
             "# 🎙️ Voiceover Studio\n"
             "**1)** pick a voice  →  **2)** add your script(s)  →  **3)** render. "
-            "Every clip is saved to the `outputs/` folder."
+            "Every clip is saved to the `outputs/` folder, checked against your "
+            "script, and levelled to the same loudness."
         )
 
         with gr.Row(equal_height=False):
@@ -1219,6 +1793,12 @@ def build_ui() -> gr.Blocks:
                 st_ref = gr.Audio(
                     label="Upload a 3–10s voice clip   ·   leave empty = AI voice",
                     type="filepath",
+                )
+                gr.Markdown(
+                    "<span style='font-size:0.82em;color:#888'>Best results: 6–10s, "
+                    "one speaker, no background noise, and <b>ending on a finished "
+                    "sentence</b> — a clip that stops mid-word can leak that word "
+                    "into every clip you generate.</span>"
                 )
                 with gr.Row():
                     st_voice_name = gr.Textbox(
@@ -1286,7 +1866,8 @@ def build_ui() -> gr.Blocks:
                         )
                         st_duration = gr.Number(
                             value=None, label="Duration (seconds)",
-                            info="Empty = auto. Fixed value disables chunking.",
+                            info="Empty = auto. Fixed value disables chunking "
+                                 "and script checking.",
                         )
                     with gr.Row():
                         st_denoise = gr.Checkbox(value=True, label="Denoise")
@@ -1401,9 +1982,10 @@ demo = build_ui()
 _THEME = gr.themes.Soft(font=["Inter", "Arial", "sans-serif"])
 _CSS = """
 .gradio-container {max-width: 100% !important;}
-.vq-pills {display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;}
+.vq-pills {display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;}
 .vq-pill {padding:5px 12px; border-radius:999px; font-size:0.85em; font-weight:600;
   background:var(--block-background-fill); border:1px solid var(--border-color-primary);}
+.vq-gpu {font-size:0.76em; color:var(--body-text-color-subdued); margin-bottom:10px;}
 .vq-board {display:flex; flex-direction:column; gap:10px; max-height:62vh; overflow-y:auto;
   padding-right:4px;}
 .vq-card {display:flex; align-items:center; justify-content:space-between; gap:12px;
@@ -1422,6 +2004,9 @@ _CSS = """
 .vq-ref {font-size:0.76em; color:var(--body-text-color-subdued); font-style:italic;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:300px;
   margin-top:2px; opacity:0.85;}
+.vq-warn {font-size:0.76em; color:#9a3412; background:#ffedd5; border-radius:8px;
+  padding:3px 8px; margin-top:4px; max-width:420px;}
+.vq-good {font-size:0.74em; color:#166534; margin-top:4px; opacity:0.9;}
 .vq-right {display:flex; align-items:center; gap:12px; flex:0 0 auto;}
 .vq-info {font-size:0.8em; color:var(--body-text-color-subdued); white-space:nowrap;}
 .vq-file {display:inline-block; margin-top:5px; font-size:0.74em; color:#166534;
@@ -1447,16 +2032,43 @@ _CSS = """
 
 # ===========================================================================
 # Local REST API  (see LOCAL_API.md)
-# Runs in the SAME process as the UI (shared model + GPU + queue) on its own
-# port, so any device on the LAN can POST text + a voice and get audio back.
+#
+# CONTRACT FREEZE: POST /api/tts keeps exactly the shape it has always had —
+# multipart in, raw audio bytes out, X-Duration-Sec and X-RTF headers. Every
+# new fix (normalization, verification, loudness) applies on that path too;
+# only the *shape of the reply* is frozen. Everything new is either an extra
+# response header (additive, ignorable) or lives on /api/v2/tts.
 # ===========================================================================
-import io
+import hashlib
+from contextlib import contextmanager
 
 API_PORT = int(os.environ.get("OMNIVOICE_API_PORT", "8001"))
+STRICT_PARAMS = _env_flag("OMNIVOICE_STRICT_PARAMS", "0")
+HEALTH_STRICT = _env_flag("OMNIVOICE_HEALTH_STRICT")
+IDEM_TTL_S = float(os.environ.get("OMNIVOICE_IDEMPOTENCY_TTL", str(24 * 3600)))
+
+
+def _tenant_keys() -> Dict[str, str]:
+    """OMNIVOICE_API_KEYS="key1:acme,key2:globex" turns on per-customer voice
+    isolation. With the single legacy OMNIVOICE_API_KEY everything stays one
+    tenant, exactly as before."""
+    raw = os.environ.get("OMNIVOICE_API_KEYS", "").strip()
+    out: Dict[str, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if ":" in part:
+            k, t = part.split(":", 1)
+            if k.strip():
+                out[k.strip()] = t.strip() or "default"
+    return out
+
+
+TENANT_KEYS = _tenant_keys()
+MULTI_TENANT = bool(TENANT_KEYS)
 
 
 def _encode_audio(wav_i16, sr, fmt="mp3"):
-    """int16 mono numpy -> (bytes, media_type, ext). mp3 needs ffmpeg (present)."""
+    """int16 mono numpy -> (bytes, media_type, ext). mp3 needs ffmpeg."""
     fmt = (fmt or "mp3").lower()
     if fmt == "wav":
         buf = io.BytesIO()
@@ -1469,158 +2081,593 @@ def _encode_audio(wav_i16, sr, fmt="mp3"):
     return buf.getvalue(), "audio/mpeg", "mp3"
 
 
-def _resolve_api_voice(voice_bytes, voice_filename, voice_id, ref_text):
-    """Return (prebuilt_prompt_or_None, ref_used, mode)."""
-    if voice_id:
-        prompt, ref_used = get_voice_prompt(voice_id)
-        if prompt is None:
-            raise KeyError(f"voice_id '{voice_id}' not found")
-        return prompt, ref_used, "clone"
-    if voice_bytes:
-        suffix = os.path.splitext(voice_filename or "ref.wav")[1] or ".wav"
-        fd, tmp = tempfile.mkstemp(suffix=suffix, prefix="api_ref_")
-        os.close(fd)
-        with open(tmp, "wb") as f:
-            f.write(voice_bytes)
-        prompt, ref_used = _get_or_build_prompt(tmp, ref_text)
-        return prompt, ref_used, "clone"
-    return None, "", "design"
+# ---- idempotency ----------------------------------------------------------
+_IDEM: Dict[str, Dict[str, Any]] = {}
+_IDEM_LOCK = threading.Lock()
 
 
-def _api_enqueue(project, script, prebuilt, ref_used, language, num_step, speed):
-    """Create a queued job (for the async API) and return its id."""
-    global _JOB_SEQ
+IDEM_MAX_ENTRIES = int(os.environ.get("OMNIVOICE_IDEMPOTENCY_MAX", "200"))
+
+
+def _idem_sweep():
+    now = time.time()
+    for k in [k for k, v in _IDEM.items() if now - v["at"] > IDEM_TTL_S]:
+        _IDEM.pop(k, None)
+    # Each entry holds encoded audio, so an unbounded cache is a slow leak.
+    if len(_IDEM) > IDEM_MAX_ENTRIES:
+        for k, _v in sorted(_IDEM.items(), key=lambda kv: kv[1]["at"])[
+                :len(_IDEM) - IDEM_MAX_ENTRIES]:
+            _IDEM.pop(k, None)
+
+
+def _idem_lookup(key: Optional[str]):
+    """Returns ('hit', payload) | ('busy', None) | ('new', None).
+
+    A client whose request timed out will retry work the server already did.
+    Without this the GPU pays twice, and on a ten-hour day that is real money.
+    """
+    if not key:
+        return "new", None
+    with _IDEM_LOCK:
+        _idem_sweep()
+        entry = _IDEM.get(key)
+        if entry is None:
+            _IDEM[key] = {"at": time.time(), "state": "running", "payload": None}
+            return "new", None
+        if entry["state"] == "running":
+            return "busy", None
+        return "hit", entry["payload"]
+
+
+def _idem_store(key: Optional[str], payload: Any):
+    if not key:
+        return
+    with _IDEM_LOCK:
+        _IDEM[key] = {"at": time.time(), "state": "done", "payload": payload}
+
+
+def _idem_drop(key: Optional[str]):
+    if not key:
+        return
+    with _IDEM_LOCK:
+        if _IDEM.get(key, {}).get("state") == "running":
+            _IDEM.pop(key, None)
+
+
+def _hdr(value: Any, limit: int = 480) -> str:
+    """HTTP headers are latin-1; a script is not. Never let a header kill a
+    response that is otherwise fine."""
+    s = str(value if value is not None else "")
+    s = s.replace("\n", " ").replace("\r", " ")
+    s = s.encode("ascii", "replace").decode("ascii")
+    return s[:limit]
+
+
+def _queue_depth() -> int:
     with JOBS_LOCK:
-        _JOB_SEQ += 1
-        jid = _JOB_SEQ
-        JOBS.append({
-            "id": jid, "project": _safe_name(project), "status": "Queued",
-            "info": "", "file": None, "cancel": False, "ref_used": ref_used,
-            "params": {
-                "script": script, "ref_audio": None, "clone_prompt": prebuilt,
-                "ref_text": None, "language": language, "num_step": int(num_step),
-                "guidance_scale": 2.0, "denoise": True,
-                "speed": float(speed), "duration": None,
-                "preprocess": True, "postprocess": True,
-            },
-        })
-    JOB_Q.put(jid)
-    return jid
+        return sum(1 for j in JOBS if j["status"] in ("Queued", "Processing"))
+
+
+def _api_enqueue(project, script, prebuilt, ref_used, language, num_step, speed,
+                 seed=None, baseline=None, voice_id=None, owner=None):
+    """Create a queued job (for the async API) and return its id."""
+    params = {
+        "ref_audio": None, "ref_text": None, "language": language,
+        "num_step": int(num_step), "guidance_scale": 2.0, "denoise": True,
+        "speed": float(speed), "duration": None,
+        "preprocess": True, "postprocess": True,
+        "seed": seed, "baseline_wpm": baseline,
+        "voice_id": voice_id, "owner": owner,
+    }
+    return _new_job(_safe_name(project), script, prebuilt, ref_used, params)
+
+
+def _run_selftest() -> Optional[Tuple[bool, str]]:
+    """Generate four words. The only answer to 'is this server working?' that
+    is worth anything — a VRAM reading said 'ok' for twenty minutes while every
+    request returned 500."""
+    if not GEN_SLOTS.acquire(blocking=False):
+        return None                     # real work is running; that is 'alive'
+    t0 = time.monotonic()
+    try:
+        rep: Dict[str, Any] = {}
+        out, status = _gen_core("Testing one two three.", None, None, None,
+                                8, 2.0, True, 1.0, None, True, True,
+                                mode="design", report=rep)
+        if out is None:
+            return False, status
+        return True, f"spoke in {(time.monotonic() - t0) * 1000:.0f} ms"
+    except Exception as e:  # noqa: BLE001
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        GEN_SLOTS.release()
+
+
+def _prewarm_voices():
+    """Build every saved voice's prompt once at startup.
+
+    Otherwise the first request for each voice pays 50-200 ms of GPU time to
+    re-encode a reference that has not changed since it was registered — and it
+    pays it again after every restart, which on this server means after every
+    OOM recovery.
+    """
+    time.sleep(5)
+    for name in list_voice_names():
+        try:
+            get_voice_prompt(name)
+            log.info("pre-warmed voice %s", name)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not pre-warm voice %s: %s", name, e)
+
+
+def _selftest_loop():
+    time.sleep(10)
+    while True:
+        try:
+            res = _run_selftest()
+            if res is not None:
+                READY.record(res[0], res[1])
+                if not res[0]:
+                    log.warning("self-test failed: %s", res[1])
+        except Exception as e:  # noqa: BLE001
+            log.warning("self-test loop error: %s", e)
+        time.sleep(max(15.0, SELFTEST_EVERY))
 
 
 def _build_api():
-    from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
-    from fastapi.responses import Response, JSONResponse
+    from fastapi import (FastAPI, File, Form, Header, HTTPException, Request,
+                         UploadFile)
+    from fastapi.responses import JSONResponse, Response
+    from starlette.concurrency import run_in_threadpool
 
-    api = FastAPI(title="OmniVoice Local API", version="1.0",
+    api = FastAPI(title="OmniVoice Local API", version=API_VERSION,
                   docs_url="/api/docs", openapi_url="/api/openapi.json")
 
-    def _auth(x_api_key):
+    # ---- auth / tenants --------------------------------------------------
+    def _auth(x_api_key) -> Optional[str]:
+        """Returns the owner id for this key (None = single-tenant)."""
+        if TENANT_KEYS:
+            owner = TENANT_KEYS.get((x_api_key or "").strip())
+            if not owner:
+                raise HTTPException(status_code=401,
+                                    detail="Invalid or missing API key")
+            return owner
         key = os.environ.get("OMNIVOICE_API_KEY", "").strip()
         if key and (x_api_key or "") != key:
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+            raise HTTPException(status_code=401,
+                                detail="Invalid or missing API key")
+        return None
+
+    # ---- shared plumbing -------------------------------------------------
+    @contextmanager
+    def _gen_slot():
+        """Bound concurrency instead of dying under it. Four simultaneous
+        callers used to take the whole server down; now the fourth waits, and
+        if the wait is hopeless it gets a 429 with a Retry-After it can obey."""
+        if not GEN_SLOTS.acquire(timeout=QUEUE_WAIT_S):
+            raise HTTPException(
+                status_code=429,
+                detail={"error": "busy",
+                        "message": f"the GPU is busy; waited {QUEUE_WAIT_S:.0f}s",
+                        "queue_depth": _queue_depth()},
+                headers={"Retry-After": str(max(5, int(QUEUE_WAIT_S / 10)))})
+        try:
+            yield
+        finally:
+            GEN_SLOTS.release()
+
+    async def _reject_unknown(request: Request, allowed) -> List[str]:
+        """Unknown parameters are reported, not silently accepted — but they
+        do not 400 by default, because every existing client would break on
+        day one. Flip OMNIVOICE_STRICT_PARAMS=1 once the metric is quiet."""
+        try:
+            form = await request.form()
+            extra = sorted(set(form.keys()) - set(allowed))
+        except Exception:  # noqa: BLE001
+            return []
+        if extra:
+            with METRICS_LOCK:
+                for k in extra:
+                    METRICS["unknown_params"][k] = \
+                        METRICS["unknown_params"].get(k, 0) + 1
+            if STRICT_PARAMS:
+                raise HTTPException(status_code=400, detail={
+                    "error": "unknown_params", "unknown": extra,
+                    "valid_keys": sorted(allowed)})
+        return extra
+
+    def _resolve_api_voice(voice_bytes, voice_filename, voice_id, ref_text, owner):
+        """(prompt, ref_used, mode, baseline_wpm).
+
+        An unknown voice_id is a 404, always. Silently substituting another
+        voice is the most expensive failure this product can have: the customer
+        pays for ten hours of audio in the wrong voice and only finds out at the
+        end. A 500 is visible; a wrong voice is not.
+        """
+        if voice_id:
+            if not voice_exists(voice_id, owner):
+                raise KeyError(voice_id)
+            prompt, ref_used = get_voice_prompt(voice_id)
+            if prompt is None:
+                raise KeyError(voice_id)
+            return prompt, ref_used, "clone", voice_baseline(voice_id)
+        if voice_bytes:
+            digest = hashlib.sha1(voice_bytes).hexdigest()
+            key = (digest, (ref_text or "").strip())
+            if _VOICE_CACHE["key"] == key and _VOICE_CACHE["prompt"] is not None:
+                return (_VOICE_CACHE["prompt"], _VOICE_CACHE["ref_text"],
+                        "clone", None)
+            suffix = os.path.splitext(voice_filename or "ref.wav")[1] or ".wav"
+            fd, tmp = tempfile.mkstemp(suffix=suffix, prefix="api_ref_")
+            os.close(fd)
+            try:
+                with open(tmp, "wb") as f:
+                    f.write(voice_bytes)
+                prompt, ref_used = _build_prompt(tmp, ref_text)
+            finally:
+                try:
+                    os.remove(tmp)      # the old code leaked one file per call
+                except Exception:  # noqa: BLE001
+                    pass
+            _VOICE_CACHE.update(key=key, prompt=prompt, ref_text=ref_used)
+            return prompt, ref_used, "clone", None
+        return None, "", "design", None
+
+    def _synthesize(text, language, steps, speed, prebuilt, mode, seed, baseline,
+                    voice_id=None, owner=None, project=None):
+        rep: Dict[str, Any] = {}
+        with _gen_slot():
+            out, status = _gen_core(
+                text, (None if not language or language == "Auto" else language),
+                None, None, int(steps), 2.0, True, float(speed), None, True, True,
+                mode=mode, ref_text=None, prebuilt_prompt=prebuilt, report=rep,
+                seed=seed, baseline_wpm=baseline)
+        if out is None:
+            if not HEALTH.ok:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "gpu_unavailable", "message": status,
+                            **HEALTH.as_dict()},
+                    headers={"Retry-After": "60"})
+            raise HTTPException(status_code=500, detail=status)
+        sr, wav = out
+        audit_generation(text, rep, voice_id=voice_id, owner=owner,
+                         project=project, wav=wav, sr=sr, source="api")
+        return sr, wav, status, rep
+
+    def _headers(rep, project, ext, sr, wav):
+        dur = len(wav) / sr if sr else 0.0
+        h = {
+            "X-Duration-Sec": f"{dur:.2f}",
+            "X-RTF": f"{rep.get('rtf', 0):.3f}",
+            "X-WPM": f"{rep.get('wpm', 0):.0f}",
+            "X-LUFS": f"{(rep.get('loudness') or {}).get('out_lufs', '')}",
+            "X-True-Peak-dB": f"{(rep.get('loudness') or {}).get('true_peak_db', '')}",
+            "X-Verified": "true" if rep.get("verified") else "false",
+            "X-OmniVoice-API-Version": API_VERSION,
+            "X-OmniVoice-Normalized-Text": _hdr(rep.get("normalized_text")),
+            "Content-Disposition": f'attachment; filename="{_safe_name(project)}.{ext}"',
+        }
+        if rep.get("warnings"):
+            h["X-OmniVoice-Warning"] = _hdr("; ".join(rep["warnings"]))
+        return h
+
+    def _meta(rep, project, ext, sr, wav, voice_id, ref_used, mode):
+        return {
+            "ok": True,
+            "project": _safe_name(project),
+            "format": ext,
+            "duration_sec": round(len(wav) / sr, 2) if sr else 0.0,
+            "sampling_rate": sr,
+            "voice": "cloned" if mode == "clone" else "designed",
+            "voice_id": voice_id,
+            "ref_text": ref_used,
+            "normalized_text": rep.get("normalized_text"),
+            "verified": rep.get("verified", False),
+            "verification": rep.get("diffs", []),
+            "warnings": rep.get("warnings", []),
+            "wpm": rep.get("wpm"),
+            "baseline_wpm": rep.get("baseline_wpm"),
+            "loudness": rep.get("loudness"),
+            "rtf": rep.get("rtf"),
+            "gen_sec": rep.get("gen_sec"),
+            "chunks": rep.get("chunks"),
+            "seed": rep.get("seed"),
+            "api_version": API_VERSION,
+        }
+
+    # ---- health ----------------------------------------------------------
+    @api.get("/api/live")
+    def live():
+        """Liveness only: the process is up. Never fails while it can answer."""
+        return {"status": "alive", "uptime_s": round(time.time() - STARTED_AT, 1)}
+
+    @api.get("/api/ready")
+    def ready():
+        """Readiness: words actually came out of the model recently.
+
+        Point a load balancer at this one, not /api/live.
+        """
+        state = READY.as_dict()
+        body = {"status": "ok" if state["ready"] else "degraded",
+                **state, "queue_depth": _queue_depth(),
+                "vram": gpu_guard.snapshot(), **HEALTH.as_dict()}
+        if not state["ready"]:
+            return JSONResponse(status_code=503, content=body,
+                                headers={"Retry-After": "30"})
+        return body
+
+    @api.get("/api/selftest")
+    def selftest():
+        res = _run_selftest()
+        if res is None:
+            return JSONResponse(status_code=409, content={
+                "status": "busy", "detail": "the GPU is generating right now"},
+                headers={"Retry-After": "10"})
+        READY.record(res[0], res[1])
+        body = {"status": "ok" if res[0] else "failed", "detail": res[1],
+                "vram": gpu_guard.snapshot()}
+        return body if res[0] else JSONResponse(status_code=503, content=body,
+                                                headers={"Retry-After": "60"})
 
     @api.get("/api/health")
     def health():
         with JOBS_LOCK:
             q = sum(1 for j in JOBS if j["status"] == "Queued")
             p = sum(1 for j in JOBS if j["status"] == "Processing")
-        return {"status": "ok", "model": "OmniVoice", "device": device_map,
-                "sampling_rate": sampling_rate, "queue": {"queued": q, "processing": p},
-                "voices": list(VOICES.keys())}
+        body = {
+            "status": "ok" if HEALTH.ok else "degraded",
+            "model": "OmniVoice", "device": device_map,
+            "sampling_rate": sampling_rate,
+            "queue": {"queued": q, "processing": p},
+            "voices": list_voice_names(),
+            "vram": gpu_guard.snapshot(),
+            "readiness": READY.as_dict(),
+            "watermark": {"enabled": WATERMARK, **watermark.status()},
+            "audit_log": AUDIT_LOG if AUDIT else None,
+            "api_version": API_VERSION,
+            **HEALTH.as_dict(),
+        }
+        if HEALTH_STRICT and not HEALTH.ok:
+            # Answering "ok" while every generation returns 500 is how a
+            # twenty-minute batch gets started against a dead server.
+            return JSONResponse(status_code=503, content=body,
+                                headers={"Retry-After": "60"})
+        return body
 
+    @api.get("/api/metrics")
+    def metrics():
+        with METRICS_LOCK:
+            snap = dict(METRICS)
+            snap["unknown_params"] = dict(snap.get("unknown_params", {}))
+        snap.update({"queue_depth": _queue_depth(),
+                     "uptime_s": round(time.time() - STARTED_AT, 1),
+                     "vram": gpu_guard.snapshot(), **HEALTH.as_dict()})
+        return snap
+
+    # ---- voices ----------------------------------------------------------
     @api.post("/api/voices")
     def register_voice(name: str = Form(...), voice: UploadFile = File(...),
-                       ref_text: str = Form(None), x_api_key: str = Header(None)):
-        _auth(x_api_key)
+                       ref_text: str = Form(None),
+                       speaker_name: str = Form(None),
+                       consent: bool = Form(None),
+                       consent_ref: str = Form(None),
+                       x_api_key: str = Header(None)):
+        owner = _auth(x_api_key)
         data = voice.file.read()
         suffix = os.path.splitext(voice.filename or "ref.wav")[1] or ".wav"
         fd, tmp = tempfile.mkstemp(suffix=suffix, prefix="api_voice_")
         os.close(fd)
-        with open(tmp, "wb") as f:
-            f.write(data)
-        vid, ref_used = save_voice(name, tmp, ref_text)
-        return {"voice_id": vid, "ref_text": ref_used}
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+            vid, rep = save_voice(name, tmp, ref_text, owner=owner,
+                                  consent=consent, consent_ref=consent_ref,
+                                  speaker_name=speaker_name)
+        except ReferenceRejected as e:
+            raise HTTPException(status_code=422, detail={
+                "error": "reference_rejected", "message": str(e),
+                "hint": "docs/reference_playbook.md"})
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:  # noqa: BLE001
+                pass
+        return {
+            "voice_id": vid,               # frozen keys
+            "ref_text": rep.get("ref_text", ""),
+            "accepted": True,
+            "quality_score": rep.get("quality_score"),
+            "baseline_wpm": rep.get("baseline_wpm"),
+            "duration_sec": rep.get("duration_sec"),
+            "lufs": (rep.get("loudness") or {}).get("out_lufs"),
+            "snr_db": rep.get("snr_db"),
+            "warnings": rep.get("warnings", []),
+            "consent": bool(consent) if consent is not None else None,
+            "consent_ref": consent_ref,
+            "hint": "docs/reference_playbook.md",
+        }
 
     @api.get("/api/voices")
-    def list_voices():
-        with VOICES_LOCK:
-            return {"voices": [{"voice_id": k, "ref_text": v["ref_text"]}
-                               for k, v in VOICES.items()]}
+    def list_voices(x_api_key: str = Header(None)):
+        owner = _auth(x_api_key) if MULTI_TENANT else None
+        return {"voices": [voice_public(n) for n in list_voice_names(owner)]}
 
     @api.delete("/api/voices/{voice_id}")
     def delete_voice_api(voice_id: str, x_api_key: str = Header(None)):
-        _auth(x_api_key)
-        if not delete_voice(voice_id):
+        owner = _auth(x_api_key)
+        if not delete_voice(voice_id, owner):
             raise HTTPException(status_code=404, detail="voice not found")
         return {"deleted": voice_id}
 
-    def _synthesize(text, language, steps, speed, prebuilt, mode):
-        out, status = _gen_core(
-            text, (None if not language or language == "Auto" else language),
-            None, None, int(steps), 2.0, True, float(speed), None, True, True,
-            mode=mode, ref_text=None, prebuilt_prompt=prebuilt)
-        if out is None:
-            raise HTTPException(status_code=500, detail=status)
-        sr, wav = out
-        return sr, wav, status
+    # ---- synthesis -------------------------------------------------------
+    _TTS_KEYS = {"text", "voice", "voice_id", "ref_text", "language", "format",
+                 "steps", "speed", "project", "seed"}
 
-    @api.post("/api/tts")
-    def tts(text: str = Form(...), voice: UploadFile = File(None),
-            voice_id: str = Form(None), ref_text: str = Form(None),
-            language: str = Form("Auto"), format: str = Form("mp3"),
-            steps: int = Form(16), speed: float = Form(1.0),
-            project: str = Form("tts"), json: int = 0, x_api_key: str = Header(None)):
-        _auth(x_api_key)
+    async def _tts_common(request, text, voice, voice_id, ref_text, language,
+                          steps, speed, x_api_key, idempotency_key, seed,
+                          allowed):
+        owner = _auth(x_api_key)
+        warn = await _reject_unknown(request, allowed)
         if not text or not text.strip():
             raise HTTPException(status_code=400, detail="text is required")
+        too_big = check_input_size(text)
+        if too_big:
+            raise HTTPException(status_code=413, detail={
+                "error": "input_too_long", "message": too_big,
+                "max_chars": MAX_INPUT_CHARS, "max_words": MAX_INPUT_WORDS})
         vbytes = voice.file.read() if voice is not None else None
         try:
-            prebuilt, ref_used, mode = _resolve_api_voice(
-                vbytes, getattr(voice, "filename", None), voice_id, ref_text)
-        except KeyError as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        sr, wav, status = _synthesize(text.strip(), language, steps, speed, prebuilt, mode)
-        audio, media, ext = _encode_audio(wav, sr, format)
-        info = status.replace("Done. ", "").strip("() ")
-        dur = len(wav) / sr if sr else 0.0
-        headers = {"X-RTF": info.split("RTF")[-1].strip() if "RTF" in info else "",
-                   "X-Duration-Sec": f"{dur:.2f}",
-                   "Content-Disposition": f'attachment; filename="{_safe_name(project)}.{ext}"'}
+            prebuilt, ref_used, mode, baseline = await run_in_threadpool(
+                _resolve_api_voice, vbytes, getattr(voice, "filename", None),
+                voice_id, ref_text, owner)
+        except KeyError:
+            raise HTTPException(status_code=404, detail={
+                "error": "unknown_voice",
+                "message": f"No registered voice '{voice_id}'.",
+                "hint": "GET /api/voices to list them, POST /api/voices to add one"})
+        return owner, warn, prebuilt, ref_used, mode, baseline
+
+    @api.post("/api/tts")
+    async def tts(request: Request,
+                  text: str = Form(...), voice: UploadFile = File(None),
+                  voice_id: str = Form(None), ref_text: str = Form(None),
+                  language: str = Form("Auto"), format: str = Form("mp3"),
+                  steps: int = Form(16), speed: float = Form(1.0),
+                  project: str = Form("tts"), seed: Optional[int] = Form(None),
+                  json: int = 0, x_api_key: str = Header(None),
+                  idempotency_key: str = Header(None)):
+        """FROZEN CONTRACT: multipart in, raw audio bytes out."""
+        state, cached = _idem_lookup(idempotency_key)
+        if state == "busy":
+            raise HTTPException(status_code=409, detail={
+                "error": "in_progress",
+                "message": "a request with this Idempotency-Key is still running"},
+                headers={"Retry-After": "10"})
+        if state == "hit":
+            _bump("idempotent_replays")
+            if json:
+                return JSONResponse(cached["json"])
+            return Response(content=base64.b64decode(cached["audio"]),
+                            media_type=cached["media"],
+                            headers={**cached["headers"],
+                                     "X-OmniVoice-Idempotent-Replay": "true"})
+        try:
+            owner, warn, prebuilt, ref_used, mode, baseline = await _tts_common(
+                request, text, voice, voice_id, ref_text, language, steps, speed,
+                x_api_key, idempotency_key, seed, _TTS_KEYS)
+            sr, wav, status, rep = await run_in_threadpool(
+                _synthesize, text.strip(), language, steps, speed, prebuilt,
+                mode, seed, baseline, voice_id, owner, project)
+            audio, media, ext = await run_in_threadpool(_encode_audio, wav, sr, format)
+        except BaseException:
+            _idem_drop(idempotency_key)
+            raise
+
+        headers = _headers(rep, project, ext, sr, wav)
+        if warn:
+            headers["X-OmniVoice-Warning"] = _hdr(
+                (headers.get("X-OmniVoice-Warning", "") + "; " if
+                 headers.get("X-OmniVoice-Warning") else "")
+                + f"unknown params ignored: {warn}")
+        info = status.split(" ⚠ ")[0].replace("Done. ", "").strip("() ")
+        payload_json = dict(_meta(rep, project, ext, sr, wav, voice_id, ref_used, mode),
+                            info=info)
         if json:
             fname = f"{_safe_name(project)}.{ext}"
             with open(os.path.join(_OUT_DIR, fname), "wb") as f:
                 f.write(audio)
-            return JSONResponse({"ok": True, "project": _safe_name(project),
-                                 "file": fname, "download_url": f"/api/files/{fname}",
-                                 "duration_sec": round(dur, 2), "info": info,
-                                 "voice": "cloned" if prebuilt else "designed",
-                                 "ref_text": ref_used})
+            payload_json.update(file=fname, download_url=f"/api/files/{fname}")
+            _idem_store(idempotency_key, {"json": payload_json, "audio":
+                                          base64.b64encode(audio).decode(),
+                                          "media": media, "headers": headers})
+            return JSONResponse(payload_json)
+        _idem_store(idempotency_key, {"json": payload_json,
+                                      "audio": base64.b64encode(audio).decode(),
+                                      "media": media, "headers": headers})
         return Response(content=audio, media_type=media, headers=headers)
 
-    @api.post("/api/tts/async")
-    def tts_async(text: str = Form(...), voice: UploadFile = File(None),
-                  voice_id: str = Form(None), ref_text: str = Form(None),
-                  language: str = Form("Auto"), steps: int = Form(16),
-                  speed: float = Form(1.0), project: str = Form("tts"),
-                  x_api_key: str = Header(None)):
-        _auth(x_api_key)
-        if not text or not text.strip():
-            raise HTTPException(status_code=400, detail="text is required")
-        vbytes = voice.file.read() if voice is not None else None
+    @api.post("/api/v2/tts")
+    async def tts_v2(request: Request,
+                     text: str = Form(...), voice: UploadFile = File(None),
+                     voice_id: str = Form(None), ref_text: str = Form(None),
+                     language: str = Form("Auto"), format: str = Form("mp3"),
+                     steps: int = Form(16), speed: float = Form(1.0),
+                     project: str = Form("tts"), seed: Optional[int] = Form(None),
+                     inline_audio: int = Form(1), x_api_key: str = Header(None),
+                     idempotency_key: str = Header(None)):
+        """Same inputs, JSON out: every number the verifier produced, plus the
+        audio inline (base64) and on disk."""
+        allowed = _TTS_KEYS | {"inline_audio"}
+        state, cached = _idem_lookup(idempotency_key)
+        if state == "busy":
+            raise HTTPException(status_code=409, detail={"error": "in_progress"},
+                                headers={"Retry-After": "10"})
+        if state == "hit":
+            _bump("idempotent_replays")
+            return JSONResponse(dict(cached["json"], idempotent_replay=True))
         try:
-            prebuilt, ref_used, _ = _resolve_api_voice(
-                vbytes, getattr(voice, "filename", None), voice_id, ref_text)
-        except KeyError as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        jid = _api_enqueue(project, text.strip(), prebuilt, ref_used,
-                           language, steps, speed)
-        return {"job_id": jid, "project": _safe_name(project), "status": "queued"}
+            owner, warn, prebuilt, ref_used, mode, baseline = await _tts_common(
+                request, text, voice, voice_id, ref_text, language, steps, speed,
+                x_api_key, idempotency_key, seed, allowed)
+            sr, wav, status, rep = await run_in_threadpool(
+                _synthesize, text.strip(), language, steps, speed, prebuilt,
+                mode, seed, baseline, voice_id, owner, project)
+            audio, media, ext = await run_in_threadpool(_encode_audio, wav, sr, format)
+        except BaseException:
+            _idem_drop(idempotency_key)
+            raise
+
+        fname = f"{_safe_name(project)}_{uuid.uuid4().hex[:8]}.{ext}"
+        try:
+            with open(os.path.join(_OUT_DIR, fname), "wb") as f:
+                f.write(audio)
+            download = f"/api/files/{fname}"
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not save %s: %s", fname, e)
+            download = None
+        body = _meta(rep, project, ext, sr, wav, voice_id, ref_used, mode)
+        body.update(file=fname, download_url=download, media_type=media,
+                    info=status.split(" ⚠ ")[0].replace("Done. ", "").strip("() "))
+        if warn:
+            body.setdefault("warnings", []).append(
+                f"unknown params ignored: {warn}")
+        if inline_audio:
+            body["audio_base64"] = base64.b64encode(audio).decode()
+        _idem_store(idempotency_key, {"json": body})
+        return JSONResponse(body)
+
+    @api.post("/api/tts/async")
+    async def tts_async(request: Request,
+                        text: str = Form(...), voice: UploadFile = File(None),
+                        voice_id: str = Form(None), ref_text: str = Form(None),
+                        language: str = Form("Auto"), steps: int = Form(16),
+                        speed: float = Form(1.0), project: str = Form("tts"),
+                        seed: Optional[int] = Form(None),
+                        x_api_key: str = Header(None)):
+        allowed = _TTS_KEYS - {"format"}
+        owner, warn, prebuilt, ref_used, mode, baseline = await _tts_common(
+            request, text, voice, voice_id, ref_text, language, steps, speed,
+            x_api_key, None, seed, allowed)
+        jid = await run_in_threadpool(
+            _api_enqueue, project, text.strip(), prebuilt, ref_used, language,
+            steps, speed, seed, baseline, voice_id, owner)
+        body = {"job_id": jid, "project": _safe_name(project), "status": "queued",
+                "queue_depth": _queue_depth()}
+        if warn:
+            body["warnings"] = [f"unknown params ignored: {warn}"]
+        return body
 
     def _job_public(j):
+        rep = j.get("report") or {}
         return {"job_id": j["id"], "project": j["project"],
                 "status": j["status"].lower().rstrip("…"),
                 "info": j["info"],
+                "warnings": j.get("warnings", []),
+                "verified": rep.get("verified", False),
+                "verification": rep.get("diffs", []),
+                "wpm": rep.get("wpm"), "loudness": rep.get("loudness"),
+                "normalized_text": rep.get("normalized_text"),
                 "download_url": (f"/api/jobs/{j['id']}/download" if j["file"] else None)}
 
     @api.get("/api/jobs/{jid}")
@@ -1631,19 +2678,83 @@ def _build_api():
                 raise HTTPException(status_code=404, detail="job not found")
             return _job_public(j)
 
+    @api.get("/api/jobs")
+    def job_list(limit: int = 50):
+        with JOBS_LOCK:
+            return {"jobs": [_job_public(j) for j in JOBS[-max(1, limit):]]}
+
     @api.get("/api/jobs/{jid}/download")
     def job_download(jid: int, format: str = "mp3"):
         with JOBS_LOCK:
             j = _find_job(jid)
             if not j:
                 raise HTTPException(status_code=404, detail="job not found")
-            path, proj = j["file"], j["project"]
+            path, proj, status = j["file"], j["project"], j["status"]
         if not path or not os.path.exists(path):
-            raise HTTPException(status_code=409, detail="not ready")
+            raise HTTPException(status_code=409, detail={
+                "error": "not_ready", "status": status.lower().rstrip("…")},
+                headers={"Retry-After": "5"})
         wav, sr = sf.read(path, dtype="int16")
         audio, media, ext = _encode_audio(wav, sr, format)
         return Response(content=audio, media_type=media, headers={
             "Content-Disposition": f'attachment; filename="{proj}.{ext}"'})
+
+    @api.post("/api/transcribe")
+    async def transcribe_api(request: Request, audio: UploadFile = File(...),
+                             text: str = Form(None),
+                             x_api_key: str = Header(None)):
+        """Transcribe a clip with the Whisper that is already loaded here.
+
+        This exists so the batch audit in the bug report can be reproduced
+        without a paid ASR service: send a generated clip plus the script it
+        was made from, and get back the same word-level diff the server uses
+        internally to check itself.
+        """
+        _auth(x_api_key)
+        data = await audio.read()
+        suffix = os.path.splitext(audio.filename or "clip.wav")[1] or ".wav"
+        fd, tmp = tempfile.mkstemp(suffix=suffix, prefix="api_asr_")
+        os.close(fd)
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+            with _gen_slot():
+                heard = await run_in_threadpool(_transcribe_path, tmp)
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:  # noqa: BLE001
+                pass
+        body: Dict[str, Any] = {"text": heard}
+        if text:
+            body["diff"] = verify.word_diff(text, heard)
+            body["ok"] = verify.passed(body["diff"])
+            body["summary"] = verify.describe(body["diff"])
+        return body
+
+    @api.post("/api/watermark/detect")
+    async def watermark_detect(audio: UploadFile = File(...),
+                               x_api_key: str = Header(None)):
+        """"Detect on complaint": was this clip generated here?
+
+        The other half of EU AI Act Article 50 marking — a mark nobody can read
+        back is not provenance.
+        """
+        _auth(x_api_key)
+        data = await audio.read()
+        suffix = os.path.splitext(audio.filename or "clip.wav")[1] or ".wav"
+        fd, tmp = tempfile.mkstemp(suffix=suffix, prefix="api_wm_")
+        os.close(fd)
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+            x, sr = await run_in_threadpool(read_audio, tmp)
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:  # noqa: BLE001
+                pass
+        return await run_in_threadpool(watermark.detect, x, sr)
 
     @api.get("/api/files/{name}")
     def get_file(name: str):
@@ -1684,30 +2795,45 @@ def _lan_ips():
     return sorted(ips)
 
 
+def _allowed_paths():
+    paths = [OUTPUT_DIR, VOICES_DIR]
+    extra = os.environ.get("OMNIVOICE_ALLOWED_PATHS", "")
+    for p in extra.replace(",", os.pathsep).split(os.pathsep):
+        p = p.strip().strip('"')
+        if p and os.path.isdir(p):
+            paths.append(p)
+    seen, out = set(), []
+    for p in paths:
+        key = os.path.normcase(os.path.abspath(p))
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
 if __name__ == "__main__":
-    # Default 0.0.0.0 -> always reachable on the local network (LAN) as well as
-    # locally. Set GRADIO_SERVER_NAME=127.0.0.1 to restrict to this PC only.
     server_name = os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0")
-    share = os.environ.get("GRADIO_SHARE", "0") == "1"
+    share = _env_flag("GRADIO_SHARE", "0")
     start_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
 
-    # Optional login: set OMNIVOICE_AUTH="user:pass" to require a password.
     _auth_env = os.environ.get("OMNIVOICE_AUTH", "").strip()
     auth = tuple(_auth_env.split(":", 1)) if ":" in _auth_env else None
     if auth:
         print(f"Login required: user '{auth[0]}'")
 
-    # Start the REST API (same process, own port) unless disabled.
-    if os.environ.get("OMNIVOICE_API", "1") == "1":
+    _api_on = _env_flag("OMNIVOICE_API")
+    if _api_on:
         threading.Thread(target=_start_api_server, daemon=True).start()
+    if SELFTEST:
+        threading.Thread(target=_selftest_loop, daemon=True).start()
+    if PREWARM_VOICES:
+        threading.Thread(target=_prewarm_voices, daemon=True).start()
 
     app = demo.queue()
-    # Auto-fallback: if the port is busy, try the next few ports.
     last_err = None
     for port in range(start_port, start_port + 11):
         try:
             _ips = _lan_ips() if server_name == "0.0.0.0" else []
-            _api_on = os.environ.get("OMNIVOICE_API", "1") == "1"
             print("=" * 60)
             print(f"  UI    (local):   http://127.0.0.1:{port}")
             for ip in _ips:
@@ -1717,6 +2843,15 @@ if __name__ == "__main__":
                 for ip in _ips:
                     print(f"  API   (LAN):     http://{ip}:{API_PORT}/api")
                 print(f"  API   docs:      http://127.0.0.1:{API_PORT}/api/docs")
+                print(f"  API   ready:     http://127.0.0.1:{API_PORT}/api/ready"
+                      "   <- point monitoring here")
+            if WATERMARK:
+                print(f"  watermark:       {watermark.status()}")
+            print(f"  verify={'on' if VERIFY else 'off'} · "
+                  f"normalize={NORMALIZE_LEVEL} · "
+                  f"loudness={'on' if NORMALIZE_OUTPUT else 'off'} "
+                  f"({OUT_TARGET_LUFS:.0f} LUFS) · concurrency={MAX_CONCURRENCY}"
+                  + (f" · tenants={len(TENANT_KEYS)}" if MULTI_TENANT else ""))
             print("=" * 60)
             app.launch(
                 server_name=server_name,
@@ -1725,8 +2860,8 @@ if __name__ == "__main__":
                 auth=auth,
                 theme=_THEME,
                 css=_CSS,
-                allowed_paths=[OUTPUT_DIR],
-                inbrowser=os.environ.get("OMNIVOICE_OPEN_BROWSER", "1") == "1",
+                allowed_paths=_allowed_paths(),
+                inbrowser=_env_flag("OMNIVOICE_OPEN_BROWSER"),
             )
             last_err = None
             break
