@@ -138,7 +138,7 @@ and it is invisible if you only look at `allocated`.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `text` | string | **required** | over `OMNIVOICE_MAX_INPUT_CHARS`/`_WORDS` → `413` |
+| `text` | string | **required** | over 8,000 chars / 1,300 words → `413`, naming `/api/tts/async`, which takes 100,000. Markdown, HTML, bullets, `[brackets]`, ALL-CAPS speaker labels and URLs are stripped before synthesis on every path |
 | `voice` | file | — | reference clip; omit for a designed voice |
 | `voice_id` | string | — | a registered voice; **unknown id → `404`, never a substitute** |
 | `ref_text` | string | — | transcript of `voice`; checked against the audio |
@@ -265,7 +265,7 @@ words that were not. Accuracy alone can never be the gate.
 | `401` | bad or missing `X-API-Key` | |
 | `404` | unknown `voice_id`, job or file | **never** a silent voice substitution |
 | `409` | job not finished; idempotency key still running | obey `Retry-After` |
-| `413` | input over the limit | split it — the message says the limits |
+| `413` | input over the **synchronous** limit | resend to `/api/tts/async`, whose limit is far higher — the message names it |
 | `422` | reference rejected (transcript mismatch) | see `detail.message` |
 | `429` | GPU busy past `OMNIVOICE_QUEUE_WAIT` | obey `Retry-After` |
 | `500` | generation failed | |

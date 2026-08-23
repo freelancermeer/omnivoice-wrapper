@@ -56,6 +56,133 @@ except Exception:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
+# 0. Script sanitising — whatever the customer actually pasted
+# ---------------------------------------------------------------------------
+# Scripts do not arrive clean. They arrive out of Google Docs, Notion, a CMS, a
+# chat window or an LLM, carrying markdown, HTML, bullet markers, footnote
+# brackets, speaker labels and URLs. Commercial guidance is unanimous that this
+# has to be stripped before synthesis: unsupported typography is documented to
+# make neural vocoders "fail or emit odd static noises" — and OmniVoice has an
+# open issue about exactly that (#31).
+#
+# Everything here runs BEFORE the punctuation rules, while colons and newlines
+# still carry their original meaning.
+_HTML_TAG_RE = re.compile(r"<[^<>\n]{1,200}>")
+_MD_IMG_RE = re.compile(r"!\[([^\]\n]{0,200})\]\([^)\n]{1,500}\)")
+_MD_LINK_RE = re.compile(r"\[([^\]\n]{1,200})\]\([^)\n]{1,500}\)")
+_MD_EMPH_RE = re.compile(r"(\*\*\*|\*\*|\*|___|__)(?=\S)(.+?)(?<=\S)\1", re.S)
+_MD_CODE_RE = re.compile(r"`{1,3}([^`\n]{1,500})`{1,3}")
+_MD_HEAD_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]*", re.M)
+_MD_QUOTE_RE = re.compile(r"^[ \t]{0,3}>[ \t]?", re.M)
+_MD_HR_RE = re.compile(r"^[ \t]{0,3}(?:[-*_][ \t]*){3,}$", re.M)
+_BULLET_RE = re.compile(r"^[ \t]{0,8}(?:[-*\u2022\u2023\u25aa\u00b7]|\d{1,3}[.)]|[a-zA-Z][.)])[ \t]+", re.M)
+# Only ALL-CAPS labels. "One thing: this matters" must survive untouched, so a
+# Title-Case label is deliberately not matched.
+_SPEAKER_RE = re.compile(r"^[ \t]{0,6}[A-Z][A-Z0-9 _-]{1,23}:[ \t]+", re.M)
+# Footnote markers, stage directions, timestamps: [1] [laughs] [00:12]
+_BRACKET_RE = re.compile(r"\[[^\]\n]{0,80}\]")
+_URL_RE = re.compile(r"\b(?:https?://|www\.)[^\s<>\"']{2,}", re.I)
+_EMAIL_RE = re.compile(r"\b[\w.+-]{1,64}@([\w-]+(?:\.[\w-]+)+)\b")
+# "?!?!?!" as well as "!!!" — alternating runs are just as common.
+_REPEAT_PUNCT_RE = re.compile(r"([!?])[!?]+")
+_DOT_RUN_RE = re.compile(r"\.{4,}")
+_CAPS_RUN_RE = re.compile(r"\b(?:[A-Z]{2,}\b[ ,]+){2,}[A-Z]{2,}\b")
+
+
+def _spoken_host(url: str) -> str:
+    """A URL read aloud is the domain, not the query string."""
+    host = re.sub(r"^https?://", "", url.strip(), flags=re.I)
+    host = host.split("/")[0].split("?")[0].split("#")[0]
+    host = re.sub(r"^www\.", "", host, flags=re.I)
+    host = host.rstrip(".,;:")
+    return host.replace(".", " dot ") if host else ""
+
+
+def sanitize_script(text: str, notes: Optional[List[str]] = None,
+                    strip_brackets: bool = True,
+                    strip_speaker_labels: bool = True) -> str:
+    """Turn whatever was pasted into something meant to be read out loud."""
+    notes = notes if notes is not None else []
+    if not text:
+        return text
+    t = text
+    hits = 0
+
+    def _sub(pattern, repl, s_in):
+        nonlocal hits
+        s_out, n = pattern.subn(repl, s_in)
+        hits += n
+        return s_out
+
+    # HTML first: entities may hide markdown, and tags may wrap it.
+    if "<" in t and ">" in t:
+        t = _sub(_HTML_TAG_RE, " ", t)
+    if "&" in t:
+        try:
+            import html as _html
+            unescaped = _html.unescape(t)
+            if unescaped != t:
+                hits += 1
+                t = unescaped
+        except Exception:  # pragma: no cover
+            pass
+
+    t = _sub(_MD_IMG_RE, " ", t)              # images say nothing
+    t = _sub(_MD_LINK_RE, r"\1", t)           # keep the label, drop the target
+    t = _sub(_MD_HR_RE, " ", t)
+    t = _sub(_MD_HEAD_RE, "", t)
+    t = _sub(_MD_QUOTE_RE, "", t)
+    t = _sub(_MD_CODE_RE, r"\1", t)
+    for _ in range(2):                        # ***bold italic*** needs two passes
+        t = _sub(_MD_EMPH_RE, r"\2", t)
+    # Line structure carries meaning that newlines alone do not survive.
+    # A bullet, a heading or the end of a paragraph is a full stop as far as
+    # the listener is concerned; without one, "...to thirty thousand Trump
+    # inflated values by..." runs three sentences together with no pause, and
+    # the sentence splitter cannot chunk it either.
+    lines = t.split("\n")
+    rebuilt = []
+    for i, line in enumerate(lines):
+        structural = bool(_BULLET_RE.match(line) or _MD_HEAD_RE.match(line)
+                          or (strip_speaker_labels and _SPEAKER_RE.match(line)))
+        line = _BULLET_RE.sub("", line)
+        if strip_speaker_labels:
+            line = _SPEAKER_RE.sub("", line)
+        stripped = line.strip()
+        if not stripped:
+            rebuilt.append("")
+            continue
+        # A hard-wrapped paragraph continues on the next line, and the very
+        # last line is the end of the script anyway — neither needs anything
+        # added. A bullet, a heading, or a line followed by a blank one does.
+        followed_by_blank = (i + 1 < len(lines) and not lines[i + 1].strip())
+        ends_a_thought = structural or followed_by_blank
+        if ends_a_thought and stripped[-1] not in ".!?":
+            stripped = stripped.rstrip(",;:") + "."
+            hits += 1
+        rebuilt.append(stripped)
+    t = "\n".join(rebuilt)
+    if strip_brackets:
+        t = _sub(_BRACKET_RE, " ", t)
+
+    t = _sub(_EMAIL_RE, lambda m: m.group(0).split("@")[0] + " at "
+             + m.group(1).replace(".", " dot "), t)
+    t = _sub(_URL_RE, lambda m: _spoken_host(m.group(0)), t)
+
+    t = _sub(_DOT_RUN_RE, "...", t)
+    t = _sub(_REPEAT_PUNCT_RE, r"\1", t)
+
+    if _CAPS_RUN_RE.search(t):
+        # Not changed: capitalisation carries emphasis, and guessing wrong is
+        # worse than leaving it. But the user should know it is in there.
+        notes.append("script contains runs of ALL-CAPS words — check how they "
+                     "are read, or add them to lexicon.json")
+    if hits:
+        notes.append(f"script cleaned ({hits} formatting item(s) removed)")
+    return t
+
+
+# ---------------------------------------------------------------------------
 # 1. Unicode cleanup
 # ---------------------------------------------------------------------------
 # Characters that must become their plain-ASCII equivalent before anything else.
@@ -180,14 +307,24 @@ def _is_english(code: Optional[str]) -> bool:
     return bool(code) and code.split("_")[0].split("-")[0] == "en"
 
 
+# num2words says "one hundred and fifty"; American narration says "one hundred
+# fifty". Set NUM_STYLE = "uk" to keep the "and".
+NUM_STYLE = "us"
+_HUNDRED_AND_RE = re.compile(r"\bhundred and\b")
+
+
 def _n2w(value, code: str, to: str = "cardinal") -> Optional[str]:
+    out = None
     try:
-        return _num2words(value, lang=code, to=to)
+        out = _num2words(value, lang=code, to=to)
     except Exception:
         try:
-            return _num2words(value, lang=code.split("_")[0], to=to)
+            out = _num2words(value, lang=code.split("_")[0], to=to)
         except Exception:
             return None
+    if out and NUM_STYLE == "us" and _is_english(code):
+        out = _HUNDRED_AND_RE.sub("hundred", out)
+    return out
 
 
 def _number_words(raw: str, code: str, years: bool = True) -> Optional[str]:
@@ -396,8 +533,17 @@ def expand_numbers(text: str, code: str, notes: List[str],
             return tok
         try:
             if len(digits) >= digit_run:
-                # 5551234567 and 555-123-4567 both read digit by digit.
-                return " ".join(_n2w(int(d), code) or d for d in digits)
+                # Digit by digit, but grouped: "five five five, one two three,
+                # four five six seven" is what a person says, and the commas
+                # become the pauses that make it followable.
+                groups = [g for g in re.split(r"[^\d]+", tok) if g]
+                if len(groups) < 2:
+                    groups = ([digits[:3], digits[3:6], digits[6:]]
+                              if len(digits) == 10
+                              else [digits[i:i + 3] for i in range(0, len(digits), 3)])
+                return ", ".join(
+                    " ".join(_n2w(int(d), code) or d for d in g)
+                    for g in groups if g)
             if "-" in tok:
                 return tok            # "1-2" is ambiguous; leave it alone
             return _number_words(tok, code, years=years) or tok
@@ -432,7 +578,8 @@ def normalize_text(text: str,
         return text, notes
 
     try:
-        t = unicode_cleanup(text, notes)
+        t = sanitize_script(text, notes) if level == "full" else text
+        t = unicode_cleanup(t, notes)
         code = resolve_n2w_lang(language, t)
         if code is None:
             # Unsupported/non-Latin: cleanup only, never touch the digits.
@@ -445,6 +592,7 @@ def normalize_text(text: str,
             t = apply_lexicon(t, lexicon, notes)
             if _is_english(code):
                 # Currency/percent/ordinal word order is English-specific.
+                t = re.sub(r"\s*&\s*", " and ", t)
                 t = expand_currency(t, code, notes)
                 t = expand_percent(t, code, notes)
                 t = expand_times(t, code, notes)

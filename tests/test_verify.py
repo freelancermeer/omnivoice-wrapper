@@ -106,3 +106,60 @@ def test_reference_transcript_mismatch_is_detected():
     assert not m["matches"]
     ok = verify.reference_matches_audio("hello there friend", "hello there friend")
     assert ok["matches"]
+
+
+# --- a re-generation costs as much as the original, so spend them wisely ----
+def test_a_misheard_proper_noun_does_not_trigger_a_regeneration():
+    """The batch saw "Bessent" transcribed as "bessant" five times and
+    "Hegseth" as "hexeth" twice. Regenerating those fixes nothing and is judged
+    by the same fallible transcriber."""
+    d = verify.word_diff("Bessent and Hegseth testified.",
+                         "bessant and hexeth testified")
+    assert d["missing"] == [] and d["extra"] == []
+    assert verify.clean(d)
+    assert not verify.worth_regenerating(d)
+    assert d["misheard"], "the substitution was not recorded at all"
+    assert "check pronunciation" in (verify.pronunciation_note(d) or "")
+    # It is still reported as a difference, per the documented diff contract.
+    assert d["hard_dropped"] and not verify.passed(d)
+
+
+def test_a_wrong_number_is_never_written_off_as_a_mishearing():
+    d = verify.word_diff("He owes five hundred million dollars.",
+                         "he owes five hundred billion dollars")
+    assert "million" in d["missing"]
+    assert verify.worth_regenerating(d)
+    assert not verify.clean(d)
+
+
+def test_a_dropped_negation_is_never_written_off():
+    d = verify.word_diff("He did not know.", "he did now know")
+    assert verify.worth_regenerating(d), d
+
+
+def test_a_genuinely_dropped_word_still_regenerates():
+    d = verify.word_diff("He called it perjury. He called it fraud.",
+                         "he called it perjury")
+    assert verify.worth_regenerating(d)
+
+
+def test_a_leaked_tail_is_repaired_not_regenerated():
+    d = verify.word_diff("Donald Trump really is.",
+                         "donald trump really is forcing him to back down")
+    assert verify.worth_regenerating(d)          # something IS wrong
+    assert verify.only_tail_is_wrong(d)          # but trimming fixes it
+
+
+def test_a_totally_garbled_clip_is_still_caught():
+    """If almost every word came back as a near-match, the clip may really be
+    mush rather than merely misheard."""
+    d = verify.word_diff("alpha bravo charlie delta",
+                         "alpna bravc charlei delfa")
+    assert verify.worth_regenerating(d), d
+
+
+def test_clean_clip_needs_nothing():
+    d = verify.word_diff("The judge ordered a seizure.",
+                         "the judge ordered a seizure")
+    assert verify.clean(d) and not verify.worth_regenerating(d)
+    assert verify.pronunciation_note(d) is None

@@ -48,6 +48,16 @@ def test_dates():
         "What about the January sixth speech?"
 
 
+def test_american_number_style_by_default():
+    """num2words says "one hundred and fifty"; American narration does not."""
+    assert norm("It was 150 dollars.") == "It was one hundred fifty dollars."
+    textnorm.NUM_STYLE = "uk"
+    try:
+        assert "hundred and fifty" in norm("It was 150 dollars.")
+    finally:
+        textnorm.NUM_STYLE = "us"
+
+
 def test_years_read_as_years():
     assert "twenty twenty-four" in norm("Back in 2024 he said so.")
 
@@ -173,3 +183,101 @@ def test_short_text_is_one_chunk():
 def test_word_count():
     assert textnorm.word_count("one two three") == 3
     assert textnorm.word_count("") == 0
+
+
+# --- whatever the customer actually pasted ---------------------------------
+# Scripts arrive out of Google Docs, Notion, a CMS or an LLM. Unsupported
+# typography is documented to make neural vocoders emit static, so none of it
+# should ever reach the model.
+def test_markdown_is_stripped_not_spoken():
+    # The heading gains a full stop: on the page it is a visual break, and out
+    # loud it has to be an audible one or it runs into the next sentence.
+    assert norm("## The Verdict\n\nThis is **damning**. He *knew*.") == \
+        "The Verdict. This is damning. He knew."
+
+
+def test_bullets_and_numbering_are_stripped():
+    out = norm("- First point\n- Second point\n1. Numbered\n2. Also numbered")
+    # Each bullet becomes its own sentence, so the reader pauses between them
+    # instead of running four list items together in one breath.
+    assert out == "First point. Second point. Numbered. Also numbered."
+
+
+def test_a_hard_wrapped_paragraph_is_not_broken_into_sentences():
+    """Text pasted out of a PDF wraps mid-sentence. Adding a full stop at every
+    line ending would put a pause in the middle of a clause."""
+    out = norm("He admitted the fake elector plot was the\n"
+               "deliberate plan to file phony slates.")
+    assert out == "He admitted the fake elector plot was the deliberate plan to file phony slates."
+
+
+def test_markdown_links_keep_the_words_and_drop_the_target():
+    assert norm("Read [the full report](https://example.com/report) now.") == \
+        "Read the full report now."
+
+
+def test_html_tags_and_entities():
+    assert norm("<p>Hello &amp; welcome</p><br>") == "Hello and welcome"
+
+
+def test_all_caps_speaker_labels_go_but_ordinary_colons_stay():
+    assert norm("NARRATOR: He walked in.\nHOST: And then?") == \
+        "He walked in. And then?"
+    # The dangerous false positive: this is a sentence, not a speaker label.
+    assert norm("One thing: this matters.") == "One thing, this matters."
+
+
+def test_stage_directions_and_footnote_markers_are_removed():
+    assert norm("He said [laughs] it was fine [1].") == "He said it was fine."
+
+
+def test_urls_are_read_as_a_domain_not_a_query_string():
+    assert norm("Visit https://www.example.com/path?x=1 today.") == \
+        "Visit example dot com today."
+
+
+def test_emails_are_readable():
+    assert "at example dot co dot uk" in norm("Email me at meer@example.co.uk please.")
+
+
+def test_runaway_punctuation_is_calmed_down():
+    out = norm("What?!?!?! Really....")
+    assert "?!" not in out
+    assert "...." not in out
+
+
+def test_all_caps_runs_are_reported_not_silently_changed():
+    out, notes = textnorm.normalize_text("THIS IS VERY IMPORTANT NEWS today.",
+                                         "English", level="full")
+    assert "THIS IS VERY IMPORTANT NEWS" in out, "emphasis was changed"
+    assert any("ALL-CAPS" in n for n in notes), notes
+
+
+def test_phone_numbers_are_grouped_like_a_person_says_them():
+    out = norm("Call 555-123-4567 now.")
+    assert out == "Call five five five, one two three, four five six seven now."
+    # Same answer without the separators.
+    assert norm("Call 5551234567 now.") == out
+
+
+def test_sanitising_never_touches_ordinary_prose():
+    src = ("He admitted the plot was not official. The judge, who had already "
+           "ruled twice, disagreed; the appeal failed.")
+    out = norm(src)
+    assert "He admitted the plot was not official." in out
+    assert "the judge, who had already ruled twice, disagreed" in out.lower()
+
+
+def test_a_pasted_document_survives_end_to_end():
+    src = ("# Segment 4\n\n"
+           "NARRATOR: A property Trump claimed was worth $500 million was "
+           "appraised at $150 million [2].\n\n"
+           "- His penthouse went from 11,000 square feet to 30,000\n"
+           "- See [the filing](https://example.com/f) for more\n")
+    out = norm(src)
+    for expected in ("five hundred million dollars",
+                     "one hundred fifty million dollars",
+                     "eleven thousand", "thirty thousand", "the filing"):
+        assert expected in out, (expected, out)
+    for banned in ("#", "[", "]", "NARRATOR", "http", "- "):
+        assert banned not in out, (banned, out)

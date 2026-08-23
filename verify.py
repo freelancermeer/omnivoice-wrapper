@@ -26,11 +26,46 @@ from __future__ import annotations
 
 import difflib
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Filler differences that are transcription artefacts rather than model errors.
 # Kept deliberately tiny — every entry here is a bug we agree not to see.
 SOFT_TOKENS = {"and", "a", "ah", "uh", "um"}
+
+# Words where "close enough" is not close enough. Confusing "million" with
+# "billion", or "not" with "now", is not a transcription quirk — it changes what
+# the clip says, and a paid voiceover cannot ship it.
+CRITICAL_WORDS = {
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+    "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "thirty",
+    "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+    "hundred", "thousand", "million", "billion", "trillion",
+    "point", "percent", "dollar", "dollars", "pound", "pounds", "euro", "euros",
+    "first", "second", "third", "fourth", "fifth", "sixth", "seventh",
+    "eighth", "ninth", "tenth",
+    "not", "no", "never", "none", "nothing", "cannot", "without", "nor",
+}
+
+# Below this, two words are different words rather than one word heard twice.
+ASR_SIMILARITY = 0.72
+
+
+def likely_asr_artifact(sent_word: str, heard_word: str,
+                        threshold: float = None) -> bool:
+    """Is this substitution the transcriber, or the model?
+
+    The production batch saw "Bessent" transcribed as "bessant" five times and
+    "Hegseth" as "hexeth" twice — proper nouns the transcriber misheard. Every
+    one of those would otherwise trigger a full re-generation that fixes
+    nothing, which is real GPU time spent on a non-problem.
+    """
+    if sent_word == heard_word:
+        return True
+    if sent_word in CRITICAL_WORDS or heard_word in CRITICAL_WORDS:
+        return False
+    thr = ASR_SIMILARITY if threshold is None else threshold
+    return difflib.SequenceMatcher(None, sent_word, heard_word).ratio() >= thr
 
 _CLEAN_RE = re.compile(r"[^a-z0-9' ]")
 
@@ -60,6 +95,12 @@ def word_diff(sent_text: str, spoken_text: str) -> Dict:
     dropped: List[str] = []
     inserted: List[str] = []
     tail_inserted: List[str] = []
+    # Finer grained than dropped/inserted: what the model really failed to say,
+    # separated from what the transcriber probably misheard.
+    missing: List[str] = []
+    extra: List[str] = []
+    misheard: List[Tuple[str, str]] = []
+
     for op, i1, i2, j1, j2 in m.get_opcodes():
         if op in ("delete", "replace"):
             dropped += sent[i1:i2]
@@ -68,9 +109,24 @@ def word_diff(sent_text: str, spoken_text: str) -> Dict:
         if op == "insert" and i1 >= len(sent):
             tail_inserted += spoken[j1:j2]
 
+        if op == "delete":
+            missing += sent[i1:i2]
+        elif op == "insert":
+            extra += spoken[j1:j2]
+        elif op == "replace":
+            a, b = sent[i1:i2], spoken[j1:j2]
+            if len(a) == len(b) and all(likely_asr_artifact(x, y)
+                                        for x, y in zip(a, b)):
+                misheard += list(zip(a, b))
+            else:
+                missing += a
+                extra += b
+
     matched = sum(b.size for b in m.get_matching_blocks())
     hard_dropped = [w for w in dropped if w not in SOFT_TOKENS]
     hard_inserted = [w for w in inserted if w not in SOFT_TOKENS]
+    real_missing = [w for w in missing if w not in SOFT_TOKENS]
+    real_extra = [w for w in extra if w not in SOFT_TOKENS]
     return {
         "sent_words": len(sent),
         "spoken_words": len(spoken),
@@ -79,6 +135,9 @@ def word_diff(sent_text: str, spoken_text: str) -> Dict:
         "tail_inserted": tail_inserted,
         "hard_dropped": hard_dropped,
         "hard_inserted": hard_inserted,
+        "missing": real_missing,
+        "extra": real_extra,
+        "misheard": misheard,
         "word_accuracy": round(matched / max(len(sent), 1), 4),
         "ok": not hard_dropped and not hard_inserted,
     }
@@ -93,23 +152,64 @@ def passed(diff: Dict, min_accuracy: float = 0.995) -> bool:
             and diff["word_accuracy"] >= min_accuracy)
 
 
+def clean(diff: Dict) -> bool:
+    """Nothing was genuinely dropped or added. Substitutions the transcriber
+    most likely misheard do not count — see `likely_asr_artifact`."""
+    return not diff.get("missing") and not diff.get("extra")
+
+
+def worth_regenerating(diff: Dict, garbled_fraction: float = 0.5,
+                       garbled_min_words: int = 3) -> bool:
+    """Should we spend GPU time making this chunk again?
+
+    Only for a real defect. A re-generation costs as much as the original, so
+    spending one on a proper noun the transcriber fumbled is pure waste — and
+    the second attempt would be judged by the same fallible transcriber.
+
+    The one exception is a clip where *most* of the words came back as
+    near-misses: that is mush, not a mishearing. Both conditions are required,
+    because "Bessent and Hegseth testified" is 50% near-misses and perfectly
+    fine — a short sentence with two proper nouns in it, nothing more.
+    """
+    if diff.get("missing") or diff.get("extra"):
+        return True
+    heard = diff.get("misheard", [])
+    if len(heard) < garbled_min_words:
+        return False
+    n = max(diff.get("sent_words", 0), 1)
+    return len(heard) / n > garbled_fraction
+
+
+def pronunciation_note(diff: Dict, limit: int = 4) -> Optional[str]:
+    """Advisory: words that came back sounding like something else."""
+    heard = diff.get("misheard") or []
+    if not heard:
+        return None
+    shown = "; ".join(f"{a} heard as {b}" for a, b in heard[:limit])
+    more = f" (+{len(heard) - limit} more)" if len(heard) > limit else ""
+    return (f"check pronunciation: {shown}{more} — add it to lexicon.json if "
+            f"it is really being said wrong")
+
+
 def describe(diff: Dict, limit: int = 6) -> str:
     """One human-readable line for a log, a job card or a response header."""
     bits = []
-    if diff["hard_dropped"]:
-        d = diff["hard_dropped"]
-        bits.append("not spoken: " + " ".join(d[:limit])
-                    + ("…" if len(d) > limit else ""))
+    missing = diff.get("missing", diff["hard_dropped"])
+    if missing:
+        bits.append("not spoken: " + " ".join(missing[:limit])
+                    + ("…" if len(missing) > limit else ""))
     if diff["tail_inserted"]:
         t = diff["tail_inserted"]
         bits.append("extra at end: " + " ".join(t[:limit])
                     + ("…" if len(t) > limit else ""))
-    extra = [w for w in diff["hard_inserted"] if w not in diff["tail_inserted"]]
+    extra = [w for w in diff.get("extra", diff["hard_inserted"])
+             if w not in diff["tail_inserted"]]
     if extra:
         bits.append("extra: " + " ".join(extra[:limit])
                     + ("…" if len(extra) > limit else ""))
     if not bits:
-        return f"verified {diff['word_accuracy']:.1%}"
+        note = pronunciation_note(diff, limit)
+        return note or f"verified {diff['word_accuracy']:.1%}"
     return "; ".join(bits)
 
 
@@ -119,11 +219,12 @@ def only_tail_is_wrong(diff: Dict) -> bool:
     This is the repairable case: the audio for the script itself is fine and
     the artefact can be cut off, instead of paying for a whole re-generation.
     """
-    if diff["hard_dropped"]:
+    if diff.get("missing", diff["hard_dropped"]):
         return False
     if not diff["tail_inserted"]:
         return False
-    non_tail = [w for w in diff["hard_inserted"] if w not in diff["tail_inserted"]]
+    non_tail = [w for w in diff.get("extra", diff["hard_inserted"])
+                if w not in diff["tail_inserted"]]
     return not non_tail
 
 

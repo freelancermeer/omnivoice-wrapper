@@ -126,6 +126,8 @@ if not NORMALIZE_LEVEL:
     NORMALIZE_LEVEL = "full" if _env_flag("OMNIVOICE_NORMALIZE") else "off"
 LEXICON_PATH = os.environ.get("OMNIVOICE_LEXICON", os.path.join(_HERE, "lexicon.json"))
 YEAR_STYLE = _env_flag("OMNIVOICE_YEARS")
+# "us" -> "one hundred fifty"; "uk" -> "one hundred and fifty".
+textnorm.NUM_STYLE = os.environ.get("OMNIVOICE_NUM_STYLE", "us").strip().lower()
 LEXICON = textnorm.load_lexicon(LEXICON_PATH)
 
 CHUNK = _env_flag("OMNIVOICE_CHUNK")
@@ -191,9 +193,24 @@ FORCE_NUM_STEP = os.environ.get("OMNIVOICE_NUM_STEP")
 DO_COMPILE = _env_flag("OMNIVOICE_COMPILE", "0")
 BATCH = int(os.environ.get("OMNIVOICE_BATCH", "1"))
 
-# --- limits (D8: one place, read everywhere) ------------------------------
+# --- limits (one place, read everywhere) ----------------------------------
+# Two limits, because there are two situations and they are not alike.
+#
+# SYNCHRONOUS: an HTTP client is holding the connection open. A script long
+# enough to take twenty minutes will time out somewhere in the middle no matter
+# what we do, so refusing it up front with a usable message is kinder than
+# failing halfway. The message names the async endpoint.
 MAX_INPUT_CHARS = int(os.environ.get("OMNIVOICE_MAX_INPUT_CHARS", "8000"))
 MAX_INPUT_WORDS = int(os.environ.get("OMNIVOICE_MAX_INPUT_WORDS", "1300"))
+# QUEUED (the Studio and /api/tts/async): nobody is waiting on a socket. Paste
+# a whole book if you like — it is chunked internally, one chunk on the GPU at
+# a time, and written to disk when it finishes. The cap here exists only to
+# stop a single job from eating RAM: the finished waveform is held in memory
+# before it is written, roughly 100 MB per 10,000 characters.
+MAX_INPUT_CHARS_ASYNC = int(os.environ.get("OMNIVOICE_MAX_INPUT_CHARS_ASYNC",
+                                           "100000"))
+MAX_INPUT_WORDS_ASYNC = int(os.environ.get("OMNIVOICE_MAX_INPUT_WORDS_ASYNC",
+                                           "18000"))
 MAX_CONCURRENCY = int(os.environ.get("OMNIVOICE_MAX_CONCURRENCY", "1"))
 QUEUE_WAIT_S = float(os.environ.get("OMNIVOICE_QUEUE_WAIT", "300"))
 
@@ -220,15 +237,18 @@ def concat_audio(parts, sr, gap_sec=GAP_SEC):
     return audio_fx.concat_audio(parts, sr, gap_sec)
 
 
-def check_input_size(text: str) -> Optional[str]:
-    """One limit, one message, used by every entry point."""
+def check_input_size(text: str, queued: bool = False) -> Optional[str]:
+    """One check, two limits — see MAX_INPUT_CHARS above."""
+    max_chars = MAX_INPUT_CHARS_ASYNC if queued else MAX_INPUT_CHARS
+    max_words = MAX_INPUT_WORDS_ASYNC if queued else MAX_INPUT_WORDS
     n_chars, n_words = len(text or ""), textnorm.word_count(text)
-    if n_chars > MAX_INPUT_CHARS:
-        return (f"text is {n_chars} characters; the limit is {MAX_INPUT_CHARS}. "
-                f"Split it into separate requests.")
-    if n_words > MAX_INPUT_WORDS:
-        return (f"text is {n_words} words; the limit is {MAX_INPUT_WORDS} "
-                f"(about 8 minutes of speech). Split it into separate requests.")
+    where = ("Split it into separate projects." if queued else
+             "Send it to POST /api/tts/async instead, which queues the work "
+             "and has a far higher limit.")
+    if n_chars > max_chars:
+        return f"text is {n_chars} characters; the limit is {max_chars}. {where}"
+    if n_words > max_words:
+        return f"text is {n_words} words; the limit is {max_words}. {where}"
     return None
 
 
@@ -529,7 +549,7 @@ def _gen_core_impl(
     if not text or not text.strip():
         return None, "Please enter the text to synthesize."
 
-    too_big = check_input_size(text)
+    too_big = check_input_size(text, queued=True)
     if too_big:
         return None, f"Error: {too_big}"
 
@@ -796,11 +816,14 @@ def _verify_stage(chunks, parts, rep, regen, cancel_check=None):
 
     diff = verify.word_diff(" ".join(chunks), heard)
     rep["verify_passes"] = 1
-    if verify.passed(diff):
+    if verify.clean(diff):
         rep["verified"] = True
         rep["verify_mode"] = "whole-clip"
         rep["verify_sec"] = round(time.perf_counter() - started, 2)
         rep["word_accuracy"] = diff["word_accuracy"]
+        note = verify.pronunciation_note(diff)
+        if note:
+            rep["warnings"].append(note)
         return parts
 
     # Something is wrong. Now it is worth finding out exactly where.
@@ -869,7 +892,11 @@ def _verify_and_repair(chunks, parts, rep, regen, cancel_check=None):
         # Then the expensive one: words that were never spoken cannot be edited
         # back in, so the chunk has to be made again.
         attempts = 0
-        while not repaired and not verify.passed(diff) and attempts < VERIFY_RETRIES:
+        # `worth_regenerating`, not `passed`: a proper noun the transcriber
+        # fumbled is not worth a second full generation, and the retry would be
+        # judged by the same fallible transcriber anyway.
+        while (not repaired and verify.worth_regenerating(diff)
+               and attempts < VERIFY_RETRIES):
             _bump("regenerations")
             attempts += 1
             try:
@@ -882,12 +909,12 @@ def _verify_and_repair(chunks, parts, rep, regen, cancel_check=None):
             except Exception:  # noqa: BLE001
                 break
             diff2 = verify.word_diff(chunk, heard2)
-            better = (len(diff2["hard_dropped"]) + len(diff2["hard_inserted"])
-                      < len(diff["hard_dropped"]) + len(diff["hard_inserted"]))
+            better = (len(diff2["missing"]) + len(diff2["extra"])
+                      < len(diff["missing"]) + len(diff["extra"]))
             if better:
                 wave, diff = candidate, diff2
                 out[idx] = candidate
-            if verify.passed(diff):
+            if not verify.worth_regenerating(diff):
                 break
             if verify.only_tail_is_wrong(diff):
                 fixed, removed = audio_fx.remove_tail_after_gap(wave, sampling_rate)
@@ -898,13 +925,19 @@ def _verify_and_repair(chunks, parts, rep, regen, cancel_check=None):
                         f"removed {removed:.1f}s of leftover reference audio "
                         f"(\"{' '.join(diff['tail_inserted'][:4])}\")")
 
-        if not repaired and not verify.passed(diff):
+        if not repaired and not verify.clean(diff):
             _bump("verify_failures")
             problems.append(f"chunk {idx + 1}: {verify.describe(diff)}")
             rep.setdefault("diffs", []).append(
-                {"chunk": idx + 1, "dropped": diff["hard_dropped"],
+                {"chunk": idx + 1, "missing": diff["missing"],
+                 "extra": diff["extra"], "misheard": diff["misheard"],
+                 "dropped": diff["hard_dropped"],
                  "inserted": diff["hard_inserted"],
                  "word_accuracy": diff["word_accuracy"]})
+        else:
+            note = verify.pronunciation_note(diff)
+            if note and note not in problems:
+                problems.append(note)
 
     rep["verified"] = checked > 0
     rep["verify_sec"] = round(time.perf_counter() - started, 2)
@@ -1599,7 +1632,7 @@ def add_job(project, script, ref_audio, ref_text, language, num_step,
             preprocess=True, postprocess=True, saved_voice=None):
     if not script or not script.strip():
         return _ui_state("⚠️ Script is empty — nothing added.")
-    too_big = check_input_size(script)
+    too_big = check_input_size(script, queued=True)
     if too_big:
         return _ui_state(f"⚠️ {too_big}")
     try:
@@ -1704,7 +1737,7 @@ def add_table(rows, ref_audio, ref_text, language, num_step,
     if not items:
         return _ui_state("⚠️ Fill at least one row with a script.")
     for _n, scr in items:
-        too_big = check_input_size(scr)
+        too_big = check_input_size(scr, queued=True)
         if too_big:
             return _ui_state(f"⚠️ {too_big}")
 
@@ -2563,16 +2596,18 @@ def _build_api():
 
     async def _tts_common(request, text, voice, voice_id, ref_text, language,
                           steps, speed, x_api_key, idempotency_key, seed,
-                          allowed):
+                          allowed, queued=False):
         owner = _auth(x_api_key)
         warn = await _reject_unknown(request, allowed)
         if not text or not text.strip():
             raise HTTPException(status_code=400, detail="text is required")
-        too_big = check_input_size(text)
+        too_big = check_input_size(text, queued=queued)
         if too_big:
             raise HTTPException(status_code=413, detail={
                 "error": "input_too_long", "message": too_big,
-                "max_chars": MAX_INPUT_CHARS, "max_words": MAX_INPUT_WORDS})
+                "max_chars": (MAX_INPUT_CHARS_ASYNC if queued else MAX_INPUT_CHARS),
+                "max_words": (MAX_INPUT_WORDS_ASYNC if queued else MAX_INPUT_WORDS),
+                "async_endpoint": None if queued else "/api/tts/async"})
         vbytes = voice.file.read() if voice is not None else None
         try:
             prebuilt, ref_used, mode, baseline = await run_in_threadpool(
@@ -2705,7 +2740,7 @@ def _build_api():
         allowed = _TTS_KEYS - {"format"}
         owner, warn, prebuilt, ref_used, mode, baseline = await _tts_common(
             request, text, voice, voice_id, ref_text, language, steps, speed,
-            x_api_key, None, seed, allowed)
+            x_api_key, None, seed, allowed, queued=True)
         jid = await run_in_threadpool(
             _api_enqueue, project, text.strip(), prebuilt, ref_used, language,
             steps, speed, seed, baseline, voice_id, owner)

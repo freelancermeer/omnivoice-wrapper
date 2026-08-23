@@ -87,6 +87,9 @@ models are local, and the `.bat` files set `HF_HUB_OFFLINE=1`.
    all using the same voice.
 3. **Settings (optional)** — language, quality steps (16 = fast, 32+ = better),
    speed, guidance, duration.
+   *Paste as much as you like:* the queue accepts up to 100,000 characters and
+   handles the splitting, cleaning and joining internally. Markdown, bullets,
+   HTML, URLs and footnote brackets are all stripped before synthesis.
 4. **Render queue** — jobs process one at a time. Each card carries its own
    metrics row — **RTF** (green under 1.0, amber over), audio length, time taken,
    wpm, LUFS, chunk count — plus the exact voice transcript used and **any
@@ -136,6 +139,8 @@ Each row below is a measured finding and where it is handled.
 | **Stitched long-form output has an audible seam** — measured elsewhere at ~28 dB energy jumps and 67–69 Hz F0 jumps at chunk boundaries, and XTTS's per-chunk normalization makes volume jump between sentences. | `audio_fx.join_chunks`: even edges, a fixed inter-sentence gap, 15 ms edge fades, and level matching to the clip's **own median** (never to a fixed per-chunk target). |
 | **Silence stripping clips final consonants**, a documented way to lose the last word of a sentence. | A 10 dB stricter edge threshold on generated audio, and 300 ms of tail padding on every clip. |
 | **133–203 wpm across one batch**; short inputs rushed. | Balanced chunking, and wpm measured per clip and compared against **that voice's own baseline** — a metric, never a gate (a documentary narrator runs ~100 wpm; a fixed 140–180 band would fail every clip). |
+| **Scripts arrive as documents, not as speech** — markdown, HTML, bullet markers, footnote brackets, speaker labels, URLs. Unsupported typography is documented to make neural vocoders "fail or emit odd static noises", and OmniVoice has an open issue about exactly that. | `textnorm.sanitize_script` strips markdown/HTML, reads URLs as domains, drops `[stage directions]` and ALL-CAPS speaker labels, calms runaway punctuation, and gives bullets and headings a full stop so they become audible pauses instead of running together. |
+| **A misheard proper noun was costing a full re-generation.** The batch saw `Bessent` transcribed as "bessant" 5× and `Hegseth` as "hexeth" 2× — the transcriber, not the model. | Substitutions are separated from real drops. A phonetically close swap becomes a *pronunciation note*, not a retry; numbers, money words and negations are never written off that way, because "million" vs "billion" is not a mishearing. |
 | Numbers, currency, em dashes, ordinals, acronyms. | A wrapper-owned text front-end ([`textnorm.py`](textnorm.py)), with the result returned in `X-OmniVoice-Normalized-Text` so it can be checked without listening. |
 | Retries after a client timeout paid for the same clip twice. | `Idempotency-Key` header; a replay returns the cached audio with `X-OmniVoice-Idempotent-Replay: true`. |
 | A typo in `voice_id` silently used a different voice. | **404, always.** Never a substitute. |
@@ -161,6 +166,7 @@ time actually goes, and what each lever costs:
 | **Quality steps** | `16` is the default and the best value. `8–10` is noticeably faster | below ~10, quality starts to show |
 | **`OMNIVOICE_VERIFY_MODE=fast`** (default) | one ASR pass over the finished clip instead of one per chunk — a five-chunk job drops from 5 extra passes to **1** | drilling into chunks only happens when something is actually wrong |
 | `OMNIVOICE_VERIFY=0` | removes checking entirely | you go back to shipping bad clips silently — the thing this exists to prevent |
+| *(automatic)* | a substitution the transcriber probably misheard no longer triggers a re-generation | none — it is reported as a pronunciation note instead |
 | `OMNIVOICE_MAX_CHARS` | larger chunks = fewer seams and fewer per-call overheads | too large and long-text degeneration returns |
 | `OMNIVOICE_BATCH` | >1 batches chunks per GPU call | usually *raises* RTF: padding to the longest chunk wastes compute. Only for long, uniform chunks |
 | `OMNIVOICE_PREWARM_VOICES=1` | no embedding rebuild on the first request per voice after a restart | none |
@@ -204,6 +210,7 @@ venv\Scripts\python tools\audit_batch.py manifest.json
 | `OMNIVOICE_NORMALIZE_LEVEL` | `full` | `full` / `basic` / `off` |
 | `OMNIVOICE_LEXICON` | `./lexicon.json` | pronunciation overrides |
 | `OMNIVOICE_YEARS` | `1` | read 1100–2099 as years ("twenty twenty-four") |
+| `OMNIVOICE_NUM_STYLE` | `us` | `us` = "one hundred fifty" · `uk` = "one hundred and fifty" |
 | `OMNIVOICE_CHUNK` | `1` | sentence chunking for long text |
 | `OMNIVOICE_MAX_CHARS` | `100` | target characters per chunk |
 
@@ -234,8 +241,10 @@ venv\Scripts\python tools\audit_batch.py manifest.json
 ### Limits & stability
 | Var | Default | Purpose |
 |-----|---------|---------|
-| `OMNIVOICE_MAX_INPUT_CHARS` | `8000` | over this → `413` |
-| `OMNIVOICE_MAX_INPUT_WORDS` | `1300` | over this → `413` (~8 min of speech) |
+| `OMNIVOICE_MAX_INPUT_CHARS` | `8000` | **synchronous** `/api/tts` only → `413`, pointing at the async endpoint |
+| `OMNIVOICE_MAX_INPUT_WORDS` | `1300` | same, ~8 min of speech |
+| `OMNIVOICE_MAX_INPUT_CHARS_ASYNC` | `100000` | the Studio queue and `/api/tts/async` — paste a whole chapter |
+| `OMNIVOICE_MAX_INPUT_WORDS_ASYNC` | `18000` | same |
 | `OMNIVOICE_MAX_CONCURRENCY` | `1` | simultaneous generations |
 | `OMNIVOICE_QUEUE_WAIT` | `300` | seconds a caller waits before `429` |
 | `OMNIVOICE_AUTO_RELOAD` | `1` | reload the model after a fatal CUDA error |

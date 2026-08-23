@@ -156,9 +156,48 @@ venv\Scripts\python -m pip install audioseal
 venv\Scripts\python -c "import watermark; print(watermark.self_check())"
 ```
 
+## 6. Second pass: how the commercial services handle input — **fixed**
+
+Two things came out of the vendor documentation.
+
+**Text sanitisation is a standard layer, and skipping it has an audible cost.**
+The recommended pipeline ends with *"Unicode and character sanitisation: strips
+invisible control characters, unsupported emojis, and non-standard typography
+**that can cause neural vocoders to fail or emit odd static noises**"*
+([VoxClone](https://voxcloneai.com/blog/how-developers-can-fix-common-tts-pronunciation-errors)).
+That last clause is not abstract — [OmniVoice #31](https://github.com/k2-fsa/OmniVoice/issues/31)
+is an open report of static noise at default settings. ElevenLabs' own
+best-practices page says the same about normalising *"phone numbers, currencies,
+dates, URLs, and abbreviations into spoken forms"*, with `"555-555-5555"` →
+`"five five five, five five five, five five five five"` — grouped, with commas
+as pauses, which we now match.
+
+We were normalising numbers but not sanitising the *document*. Scripts do not
+arrive as prose; they arrive out of Docs, Notion, a CMS or an LLM.
+`textnorm.sanitize_script` now handles markdown, HTML and entities, bullet and
+numbered list markers, `[footnotes]` and `[stage directions]`, ALL-CAPS speaker
+labels (`NARRATOR:` — but never `One thing:`), URLs read as domains, emails, and
+runaway punctuation.
+
+The subtlest part was line structure. Stripping a bullet marker leaves lines
+that end without punctuation, so `"...to thirty thousand"` and `"Trump inflated
+values..."` run together in one breath — and the sentence splitter cannot chunk
+them either. Bullets, headings and paragraph ends now get a full stop; a
+hard-wrapped paragraph deliberately does not.
+
+**Request stitching is what the commercial services do for long-form.**
+ElevenLabs exposes `previous_text` / `next_text` and `previous_request_ids` to
+*"keep prosody continuous across chunks"*
+([announcement](https://elevenlabs.io/blog/request-stitching-for-text-to-speech-api)).
+OmniVoice's `generate()` takes no such parameter, so we cannot do it properly —
+what we do instead is keep one shared voice prompt across every chunk (timbre
+stays fixed) and join the audio carefully. **Worth checking on the GPU box**
+whether the installed `omnivoice` exposes any context argument; if it does, that
+is the single biggest remaining prosody win.
+
 ---
 
-## 6. Still open — decide these deliberately
+## 7. Still open — decide these deliberately
 
 ### Two speakers in one reference — **not implemented**
 
