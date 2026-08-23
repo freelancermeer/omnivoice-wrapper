@@ -31,6 +31,12 @@ REM  Har clip ki loudness (default -20 LUFS):
 REM set OMNIVOICE_OUT_LUFS=-20
 REM  Text normalization: full / basic / off
 REM set OMNIVOICE_NORMALIZE_LEVEL=full
+REM  Verifier ek saath kitni 30s windows padhe (default 12). Ye long-form RTF
+REM  0.221 se 0.170 laaya, transcript bilkul wahi. Agar VRAM tang ho to kam
+REM  karein; 12 se upar barhane ka koi faida nahi.
+REM set OMNIVOICE_ASR_BATCH=12
+REM  Whisper ko GPU se hata kar CPU pe (VRAM bachta hai, verification slow):
+REM set OMNIVOICE_ASR_DEVICE=cpu
 
 echo Starting OmniVoice Voiceover Studio...
 echo (pehli baar model load me ~10-20 sec lagte hain)

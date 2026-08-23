@@ -637,12 +637,20 @@ class _Cancelled(Exception):
 # transcribe() passes no such argument, so it cannot read anything longer.
 ASR_WINDOW_SEC = 30.0
 
-# How many 30 s windows the verifier reads at once. Running them as a batch
-# instead of one after another is the difference between 18x and 49x realtime
-# on a 3060 Ti, for byte-identical transcripts — measured on a 203 s clip:
+# How many windows the verifier reads at once. Running them as a batch rather
+# than one after another is the difference between 18x and 49x realtime on a
+# 3060 Ti, for byte-identical transcripts — measured on a 203 s clip:
 # sequential 10.81 s, batch=8 5.00 s, batch=16 4.12 s, all 543 words, word
-# accuracy 1.0000 against the sequential result. Lower it if VRAM is tight.
-ASR_BATCH = max(1, int(os.environ.get("OMNIVOICE_ASR_BATCH", "8")))
+# accuracy 1.0000 against the sequential result.
+#
+# 12 rather than 16 because the whole gain is already there and the VRAM is
+# not. End-to-end on the same long clip: batch=8 RTF 0.221 at a 5118 MB peak,
+# batch=12 RTF 0.170 at 5936 MB, batch=16 RTF 0.169 at 6747 MB. Past 12 there
+# is nothing left to win — a clip of that length is only twelve to fifteen
+# chunks — and 6747 MB of an 8 GB card shared with a desktop is not a margin
+# worth spending for it. Lower it if VRAM is tight; raising it above the chunk
+# count does nothing.
+ASR_BATCH = max(1, int(os.environ.get("OMNIVOICE_ASR_BATCH", "12")))
 
 
 def _too_long_for_whisper(path: str) -> bool:

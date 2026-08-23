@@ -178,6 +178,9 @@ time actually goes, and what each lever costs:
 | *(not a lever)* | `guidance_scale` — upstream #163 reports it has no audible effect through the Python API | — |
 | `OMNIVOICE_BATCH` | >1 batches chunks per GPU call | usually *raises* RTF: padding to the longest chunk wastes compute. Only for long, uniform chunks |
 | `OMNIVOICE_PREWARM_VOICES=1` | no embedding rebuild on the first request per voice after a restart | none |
+| **`OMNIVOICE_ASR_BATCH`** | now `12`. The verifier reads its 30 s windows as one batch instead of one after another — long-form RTF **0.221 → 0.170**, transcripts identical (word accuracy 1.0000) | ~800 MB of VRAM. `16` buys nothing further (0.169) for another 811 MB |
+| *(automatic)* | clock times and inferred currency symbols in the transcript no longer count as errors, so they no longer buy a re-generation — one clip went **0.548 → 0.244** | none; both readings are scored and only a better match is accepted |
+| **close Parsec** | not a code lever, but the largest one on the reference box: Parsec takes **~25 % of the GPU** continuously (desktop capture + NVENC) | you lose remote access to the machine while it is closed |
 
 Measured on this machine, the CPU-side audio work is **not** where the time
 goes — on a 60 s clip: loudness normalization 126 ms, chunk joining 6 ms,
@@ -186,6 +189,17 @@ about **0.2 % of realtime**. Do not tune those; tune steps and verification.
 Two things that lower RTF for free: longer scripts amortise the fixed per-call
 overhead, and warm voices skip the embedding build. A one-line clip will always
 show a worse RTF than a paragraph — that is arithmetic, not a fault.
+
+**Measured on the reference box** (RTX 3060 Ti 8 GB, 16 steps, verification on):
+long-form **RTF ~0.17**, 240-word clips ~0.18, 60-word clips ~0.19. Ten minutes
+of finished audio renders in under two minutes. Full numbers and method in
+[GPU_RUN.md](GPU_RUN.md).
+
+**What is not available here:** upstream PR #239 (FlashInfer, "2.1x at batch
+size 1") **cannot run on Windows** — `flashinfer-jit-cache` ships Linux wheels
+only, and `flashinfer-python` needs `nccl4py`, which has no Windows build
+because NCCL does not exist on Windows. Reaching it requires a Linux
+environment; WSL2 on the same machine would qualify.
 
 ---
 

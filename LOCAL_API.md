@@ -326,6 +326,79 @@ open("out.mp3", "wb").write(__import__("base64").b64decode(body["audio_base64"])
 
 ---
 
+## 5b. What a caller can actually expect
+
+Every number here was measured on the reference box (RTX 3060 Ti 8 GB, Windows,
+16 steps, verification on). Reproduce with `tools/rtf_probe.py`.
+
+### Latency
+
+`X-RTF` is generation time over audio length, so **lower is faster** and a
+figure under 1.0 means faster than real time.
+
+| clip | audio | RTF | wall |
+|---|---:|---:|---:|
+| 12 words | 3.9 s | ~0.43–0.50 | ~1.8 s |
+| 60 words | 22.5 s | ~0.19 | ~4.2 s |
+| 240 words | 72 s | ~0.18 | ~13 s |
+| long-form | 203 s | **~0.17** | ~35 s |
+
+**Short clips are not slower for a bad reason** — a 3.9 s clip pays the same
+fixed setup as a 73 s one, so the RTF looks worse while the wall time is under
+two seconds. Size your timeouts on wall time, not on RTF.
+
+Rule of thumb for planning: **ten minutes of finished audio takes under two
+minutes to render.**
+
+### Several callers at once
+
+The GPU serves one generation at a time (`OMNIVOICE_MAX_CONCURRENCY`, default
+1 on an 8 GB card). Extra callers queue rather than fail:
+
+| simultaneous callers | per-clip RTF | outcome |
+|---|---|---|
+| 1 | 0.234 | — |
+| 4 | 0.212–0.222 | 4/4 succeeded |
+| 8 | 0.210–0.221 | 8/8 succeeded |
+
+**Per-clip speed does not degrade under load and nothing is refused** —
+throughput across 8 simultaneous callers was RTF 0.217 against 0.234 for one
+alone, so queueing costs essentially nothing. What grows is waiting: with eight
+clips in flight the last caller waited 19.4 s.
+
+That has one consequence for client design. `POST /api/tts` holds the HTTP
+connection for the whole queue wait, so **anything submitting more than one
+clip should use `POST /api/tts/async`** — it returns in about 10 ms with a
+`job_id`, and the client polls `GET /api/jobs/{id}`. Five async jobs submitted
+in 0.01 s finished in 10.3 s.
+
+Note that `/api/tts/async` deliberately does not take `format`; the warning
+saying so is the unknown-parameter mechanism working, not a bug.
+
+### Verification, and what it costs
+
+Every clip is transcribed back and diffed against the script before it is
+returned. That costs roughly **25–40 %** of render time depending on clip
+length, and it is what puts `X-Verified`, `X-OmniVoice-Warning` and the
+`diff` block in the v2 response.
+
+The transcriber's notation is read charitably, because it is not the model:
+
+* clock times come back with a full stop (`7:45` → `7.45`), which would
+  otherwise read as a decimal;
+* a transcriber that has just written `$4.2 million` writes the next bare
+  `3 million` as `$3 million`, adding a "dollars" the script never had.
+
+Both are scored both ways and the better reading wins, so a false alarm is
+removed while a word the model genuinely dropped is still reported. Confirmed
+against a second, unrelated transcriber (`tools/verify_external.py`): on ten
+clips, the built-in verifier called 10/10 clean and AssemblyAI 9/10, agreeing
+on 9/10 — the single disagreement being AssemblyAI's own mistake.
+
+Turn checking off with `OMNIVOICE_VERIFY=0` if you would rather audit the whole
+batch afterwards with `tools/audit_batch.py`; responses then carry
+`X-Verified: false`.
+
 ## 6. Running it
 
 The API starts with the app — same process, same GPU, own port.
@@ -337,7 +410,18 @@ set OMNIVOICE_API_PORT=9000           REM different port
 set OMNIVOICE_API_KEY=change-me       REM require X-API-Key
 set OMNIVOICE_API_KEYS=k1:acme,k2:globex   REM per-customer voice isolation
 set OMNIVOICE_MAX_CONCURRENCY=1       REM 1 on an 8 GB card
+set OMNIVOICE_VERIFY=0                REM ship without checking (see 5b)
+set OMNIVOICE_ASR_BATCH=12            REM verifier windows read at once
+set OMNIVOICE_ASR_DEVICE=cpu          REM move Whisper off the GPU entirely
 ```
+
+`OMNIVOICE_ASR_BATCH` is the one worth knowing about. The verifier reads its
+30 s windows as a batch instead of one after another, which on the reference
+box took long-form RTF from 0.221 to 0.170 for byte-identical transcripts.
+**12 is the default because the whole gain is already there at 12** (0.170 at a
+5936 MB peak) while 16 buys nothing (0.169) for another 811 MB on a card that
+also has a desktop on it. Lower it if VRAM is tight; raising it above the
+number of chunks in a clip does nothing at all.
 
 Before you rely on it:
 
