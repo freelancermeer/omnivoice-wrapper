@@ -88,9 +88,20 @@ def check_health(c):
 
     r = c.get("/api/health")
     if r.ok:
-        vram = r.json().get("vram", {})
+        body = r.json()
+        vram = body.get("vram", {})
         record("health reports VRAM allocated AND reserved",
                PASS if "reserved_mb" in vram else FAIL, json.dumps(vram)[:110])
+        ver = body.get("omnivoice_version", "?")
+        feats = [k for k, v in (body.get("features") or {}).items() if v]
+        record("omnivoice is current (>= 0.2.1)",
+               FAIL if body.get("omnivoice_outdated") else PASS,
+               f"{ver} · features: {', '.join(feats) or 'none'}",
+               required=False)
+        if "flashinfer" in feats:
+            record("FlashInfer is available on this build", INFO,
+                   "set OMNIVOICE_FLASHINFER=1 for the reported 2-2.9x speedup",
+                   required=False)
     return True
 
 

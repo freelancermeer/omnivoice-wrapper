@@ -37,6 +37,12 @@ venv\Scripts\hf.exe download k2-fsa/OmniVoice --local-dir Model
 venv\Scripts\python app.py
 ```
 
+**Already have a venv?** Re-run the `-r requirements.txt` line: this targets
+**omnivoice 0.2.1**, and the app prints a loud warning at startup if it finds an
+older one. 0.1.5 still runs, but without control over the model's own
+fade/padding, the punctuation fix, `asr_device`, or cached voices that survive a
+restart.
+
 The app auto-detects `./Model` and loads from it (fully offline afterwards). If
 you skip step 4 it downloads from HuggingFace on first launch instead. The
 **Whisper** ASR model (`openai/whisper-large-v3-turbo`, ~1.6 GB) downloads
@@ -269,6 +275,17 @@ since 2 August 2026.
 | `OMNIVOICE_AUDIT_TEXT` | `0` | log full scripts, not just hashes |
 | `OMNIVOICE_REQUIRE_CONSENT` | `0` | refuse voice registration without `consent` + `consent_ref` |
 | `OMNIVOICE_PREWARM_VOICES` | `0` | build every saved voice's prompt at startup |
+
+### omnivoice version features
+The wrapper feature-detects these, so an older install still runs. `GET /api/health`
+reports `omnivoice_version` and which are available.
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `OMNIVOICE_ASR_DEVICE` | _(unset)_ | where Whisper loads (0.2.1+); `cpu` frees VRAM at the cost of speed |
+| `OMNIVOICE_PAD_DURATION` | _(model default)_ | the model's own trailing silence (0.2.0+) — raise it if final consonants are being clipped |
+| `OMNIVOICE_FADE_DURATION` | _(model default)_ | the model's own fade (0.2.0+) — upstream #194 reports it "sometimes adds artifact" |
+| `OMNIVOICE_FLASHINFER` | `0` | 2–2.9× lossless speedup (upstream PR #239). Needs omnivoice from git main plus `flashinfer-python`; see requirements.txt |
 
 ### Model, server, API
 | Var | Default | Purpose |

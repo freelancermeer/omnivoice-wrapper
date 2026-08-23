@@ -55,3 +55,6 @@ Desktop.ini
 
 # Generation / consent audit trail (machine-specific)
 logs/
+
+# Cached built voices (rebuildable, machine-specific)
+*.omniprompt

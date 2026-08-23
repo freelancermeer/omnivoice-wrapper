@@ -175,6 +175,8 @@ stochastic model:
 
 ```powershell
 git pull
+REM 0. Upgrade omnivoice 0.1.5 -> 0.2.1. The app warns loudly if you skip this.
+venv\Scripts\python -m pip install -r requirements.txt
 venv\Scripts\python -m pip install pytest requests
 
 REM 1. No GPU needed. Should be 58 passed.
@@ -202,6 +204,25 @@ REM    then set OMNIVOICE_WATERMARK=1, OMNIVOICE_REQUIRE_CONSENT=1 in run.bat
 
 Step 5 is the one that answers the question. Target: **0 words added, 0 words
 dropped**, where the same 63 clips previously showed 218 added and 12 dropped.
+
+### The one experiment worth running for RTF
+
+`omnivoice` PR #239 reports a **2-2.9x lossless speedup** (2.1x at batch size 1,
+which is your case) from FlashInfer. It was merged *after* the 0.2.1 release, so
+it needs git main:
+
+```powershell
+venv\Scripts\python -m pip install "omnivoice @ git+https://github.com/k2-fsa/OmniVoice"
+venv\Scripts\python -m pip install flashinfer-python==0.6.15.post1 ^
+    "flashinfer-jit-cache==0.6.15.post1+cu128" ^
+    --extra-index-url https://flashinfer.ai/whl/cu128/
+set OMNIVOICE_FLASHINFER=1
+```
+
+The startup banner says whether the flag was accepted. It was measured on an
+H100; your 3060 Ti is Ampere (sm_86) and untested, so run
+`tools\acceptance.py` and `tools\audit_batch.py` before trusting it — "lossless"
+is the author's claim, not a measurement on your hardware.
 
 ### What to watch on the first long run
 

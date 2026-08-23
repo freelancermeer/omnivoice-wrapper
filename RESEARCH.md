@@ -5,7 +5,7 @@ that our own batch did not show?** Our four bug documents came from one machine,
 three voices and 63 clips. This is what everyone else running zero-shot voice
 cloning in production has hit, and what regulators have started to require.
 
-Nine gaps came out of it. Four are now fixed, two are open risks you should
+Ten gaps came out of it. Four are now fixed, two are open risks you should
 decide about deliberately. There is also a legal section, because you said you
 are selling this to the public — that part is not optional any more.
 
@@ -258,7 +258,50 @@ careful joining. All three are now in place.
 
 ---
 
-## 8. Still open — decide these deliberately
+## 8. We were three months and two releases behind
+
+The most useful thing in the whole survey turned out to be a version number.
+`requirements.txt` pinned **omnivoice 0.1.5 (28 April)**. The current release is
+**0.2.1 (16 July)** — and the batch that found all these bugs was measured on
+0.1.5.
+
+What 0.2.x adds that matters here:
+
+| Version | Change | Why it matters to us |
+|---|---|---|
+| 0.2.0 | *"Expose `pad_duration` and `fade_duration` to let users control fade-in/out and silence padding"* | Directly answers [#194](https://github.com/k2-fsa/OmniVoice/issues/194) ("this function sometimes adds artifact") and gives a real lever for [#204](https://github.com/k2-fsa/OmniVoice/issues/204)/[#245](https://github.com/k2-fsa/OmniVoice/issues/245), clips losing their last word |
+| 0.2.0 | Fixed punctuation handling in text processing | [#181](https://github.com/k2-fsa/OmniVoice/issues/181), the `END_PUNCTUATION` bug |
+| 0.2.1 | `asr_device`, and Whisper no longer forced onto GPU 0 ([PR #224](https://github.com/k2-fsa/OmniVoice/pull/224)) | The verifier's ASR can be placed deliberately — the concern raised in §5 of the corrections note |
+| 0.2.1 | **`VoiceClonePrompt.save()` / `.load()`** ([PR #223](https://github.com/k2-fsa/OmniVoice/pull/223)) | A built voice survives a restart instead of being re-encoded — and on this server "restart" means "after every OOM recovery" |
+| 0.2.1 | Avoid decoding the whole reference just to read its duration ([PR #220](https://github.com/k2-fsa/OmniVoice/pull/220)) | Registration gets cheaper |
+| 0.2.1 | Opt-in `generate(normalize_text=True)` ([PR #227](https://github.com/k2-fsa/OmniVoice/pull/227)) | Their normalizer, off by default. We keep ours — it is tested against our own scripts |
+
+`requirements.txt` now pins **0.2.1**, all four capabilities are used where
+present, and the app prints a loud warning at startup if it finds anything
+older. 0.1.5 still runs.
+
+### And the RTF answer, such as it is
+
+[**PR #239**](https://github.com/k2-fsa/OmniVoice/pull/239), merged **30 July** —
+*after* the 0.2.1 release, so it exists only on git main:
+
+> **FlashInfer-accelerated inference (2-2.9x lossless speedup)** … batch size 1:
+> 2.1x faster (2.4x with CUDA graphs) … outputs ASR-verified lossless.
+
+Batch size 1 is exactly this server's case. On an RTF of 0.16 that would be
+roughly **0.06-0.08**. Two honest caveats: it was measured on an **H100**, and a
+3060 Ti is Ampere (sm_86); and "lossless" is the author's claim, verified with
+their ASR, not with yours — which is precisely what `tools/audit_batch.py` is
+for. The install lines are in `requirements.txt`, and the wrapper reports at
+startup whether the flag was accepted rather than failing on it.
+
+Note what upgrading does **not** fix: [#199](https://github.com/k2-fsa/OmniVoice/issues/199),
+the VRAM leak, is still open and no merged PR addresses it. `gpu_guard.py` stays
+load-bearing.
+
+---
+
+## 9. Still open — decide these deliberately
 
 ### Two speakers in one reference — **not implemented**
 

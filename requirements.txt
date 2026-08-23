@@ -18,7 +18,19 @@ torch==2.8.0+cu128
 torchaudio==2.8.0+cu128
 
 # ---- OmniVoice + Transformers stack ----
-omnivoice==0.1.5
+# 0.2.1 (16 Jul 2026), up from 0.1.5 (28 Apr). Worth having:
+#   0.2.0  pad_duration / fade_duration      control the model's own fade and
+#                                            silence padding (upstream #194:
+#                                            the built-in fade "sometimes adds
+#                                            artifact"; #204/#245 lose the last
+#                                            word)
+#   0.2.0  fixed punctuation handling        upstream #181
+#   0.2.1  asr_device                        Whisper no longer forced onto GPU 0
+#   0.2.1  VoiceClonePrompt.save()/load()    a built voice survives a restart
+#                                            instead of being re-encoded
+# The wrapper feature-detects all of these, so 0.1.5 still runs.
+# NOTE: this does NOT fix the VRAM leak — upstream #199 is still open.
+omnivoice==0.2.1
 transformers==5.12.1
 tokenizers==0.22.2
 accelerate==1.14.0
@@ -121,6 +133,21 @@ Pygments==2.20.0
 braceexpand==0.1.7
 docopt==0.6.2
 setuptools==70.2.0
+
+# ---- OPTIONAL: FlashInfer — the one real RTF lever left ----
+# PR #239 (merged 30 Jul 2026, AFTER the 0.2.1 release) reports a "2-2.9x
+# lossless speedup", 2.1x at batch size 1, ASR-verified identical output.
+# It is not in any PyPI release yet, so it needs main:
+#
+#   pip install "omnivoice @ git+https://github.com/k2-fsa/OmniVoice"
+#   pip install flashinfer-python==0.6.15.post1 \
+#       "flashinfer-jit-cache==0.6.15.post1+cu128" \
+#       --extra-index-url https://flashinfer.ai/whl/cu128/
+#
+# Then set OMNIVOICE_FLASHINFER=1. The wrapper checks whether this build
+# accepts the flag and says so at startup rather than failing.
+# Measured on an H100; Ampere (RTX 3060 Ti, sm_86) is untested — verify with
+# tools/acceptance.py before trusting it in production.
 
 # ---- OPTIONAL: flash-attention ----
 # NOT required — OmniVoice does not support flash_attention_2 (the app uses

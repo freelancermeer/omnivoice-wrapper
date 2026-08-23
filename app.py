@@ -90,6 +90,8 @@ import torch
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.cli.demo import _ALL_LANGUAGES
 
+import inspect
+
 import audio_fx
 import gpu_guard
 import textnorm
@@ -398,30 +400,135 @@ else:
     print(f"CUDA not available -> loading {CHECKPOINT} on CPU (this will be slow) ...")
 
 print(f"Checkpoint: {CHECKPOINT}")
+
+# ---------------------------------------------------------------------------
+# Version-tolerant feature use
+# ---------------------------------------------------------------------------
+# 0.2.1 is the supported baseline (requirements.txt pins it). Detection is kept
+# because FlashInfer landed AFTER 0.2.1 and only exists on git main, and because
+# an old install should degrade with a clear message rather than a traceback.
+#
+#   0.2.0  pad_duration / fade_duration      control over the model's own
+#                                            fade-in/out and silence padding
+#                                            (upstream #194: the built-in fades
+#                                            "sometimes add artifact")
+#   0.2.0  fixed punctuation handling        upstream #181
+#   0.2.1  asr_device                        stop Whisper always landing on
+#                                            GPU 0 (upstream PR #224)
+#   0.2.1  VoiceClonePrompt.save()/load()    reuse a built voice across
+#                                            restarts instead of re-encoding
+#   main   enable_flashinfer                 PR #239, "2-2.9x lossless
+#                                            speedup"; 2.1x at batch size 1
+def _accepts(fn, name: str) -> bool:
+    """Does this callable take `name` as a real, named parameter?
+
+    Deliberately does not count **kwargs: something that swallows anything
+    tells us nothing about whether it does anything.
+    """
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtins/C funcs
+        return False
+
+
+def _omnivoice_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("omnivoice")
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+MIN_OMNIVOICE = (0, 2, 1)
+OMNIVOICE_VERSION = _omnivoice_version()
+
+
+def _version_tuple(v: str):
+    parts = []
+    for chunk in v.split("."):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts[:3]) or (0,)
+
+
+OMNIVOICE_OUTDATED = (OMNIVOICE_VERSION != "unknown"
+                      and _version_tuple(OMNIVOICE_VERSION) < MIN_OMNIVOICE)
+FEATURES = {
+    "asr_device": _accepts(OmniVoice.from_pretrained, "asr_device"),
+    "flashinfer": _accepts(OmniVoice.from_pretrained, "enable_flashinfer"),
+    "pad_duration": _accepts(OmniVoiceGenerationConfig, "pad_duration"),
+    "fade_duration": _accepts(OmniVoiceGenerationConfig, "fade_duration"),
+}
+ASR_DEVICE = os.environ.get("OMNIVOICE_ASR_DEVICE", "").strip() or None
+USE_FLASHINFER = _env_flag("OMNIVOICE_FLASHINFER", "0")
+# None keeps whatever the model does by default. Set these only if the built-in
+# fade is clipping your final consonants.
+PAD_DURATION = os.environ.get("OMNIVOICE_PAD_DURATION", "").strip()
+FADE_DURATION = os.environ.get("OMNIVOICE_FADE_DURATION", "").strip()
 _ATTN = os.environ.get("OMNIVOICE_ATTN", "sdpa")
 
 
-def _load_model(attn):
-    return OmniVoice.from_pretrained(
-        CHECKPOINT,
+def _load_model(attn, extras: Optional[Dict[str, Any]] = None):
+    kw: Dict[str, Any] = dict(
         device_map=device_map,
         dtype=dtype,
         load_asr=True,
         asr_model_name=ASR_MODEL,
         attn_implementation=attn,
     )
+    kw.update(extras or {})
+    return OmniVoice.from_pretrained(CHECKPOINT, **kw)
 
 
+def _load_extras() -> Dict[str, Any]:
+    """Only the newer options this installation actually understands."""
+    extras: Dict[str, Any] = {}
+    if ASR_DEVICE and FEATURES["asr_device"]:
+        extras["asr_device"] = ASR_DEVICE
+    elif ASR_DEVICE:
+        log.warning("OMNIVOICE_ASR_DEVICE needs omnivoice >= 0.2.1 "
+                    "(installed: %s) — ignoring", OMNIVOICE_VERSION)
+    if USE_FLASHINFER and FEATURES["flashinfer"]:
+        extras["enable_flashinfer"] = True
+    elif USE_FLASHINFER:
+        log.warning(
+            "OMNIVOICE_FLASHINFER is set but this omnivoice (%s) does not "
+            "accept enable_flashinfer. It landed after 0.2.1 — install from "
+            "git main plus flashinfer-python to use it.", OMNIVOICE_VERSION)
+    return extras
+
+
+_EXTRAS = _load_extras()
 try:
-    model = _load_model(_ATTN)
-    print(f"Model loaded successfully! (attention: {_ATTN})")
+    model = _load_model(_ATTN, _EXTRAS)
+    print(f"Model loaded successfully! (attention: {_ATTN}"
+          + (f", {', '.join(sorted(_EXTRAS))}" if _EXTRAS else "") + ")")
 except Exception as e:
-    if _ATTN != "sdpa":
-        log.warning("attn '%s' failed (%s); falling back to sdpa", _ATTN, e)
-        model = _load_model("sdpa")
-        print("Model loaded successfully! (attention: sdpa)")
-    else:
-        raise
+    # Two things can go wrong: the attention backend, or one of the newer
+    # options. Peel them off in that order rather than failing to start.
+    log.warning("model load failed (%s); retrying with plain defaults", e)
+    try:
+        model = _load_model(_ATTN)
+        _EXTRAS = {}
+        print(f"Model loaded successfully! (attention: {_ATTN}, extras dropped)")
+    except Exception:
+        if _ATTN != "sdpa":
+            model = _load_model("sdpa")
+            _EXTRAS = {}
+            print("Model loaded successfully! (attention: sdpa)")
+        else:
+            raise
+print(f"omnivoice {OMNIVOICE_VERSION} · features: "
+      + (", ".join(k for k, v in FEATURES.items() if v) or "none detected"))
+if OMNIVOICE_OUTDATED:
+    print("=" * 60)
+    print(f"  WARNING: omnivoice {OMNIVOICE_VERSION} is older than the "
+          f"{'.'.join(map(str, MIN_OMNIVOICE))} this wrapper targets.")
+    print("  Missing: control over the model's own fade/padding (the fade is")
+    print("  reported upstream to add artifacts), the punctuation-handling fix,")
+    print("  asr_device, and cached voices that survive a restart.")
+    print("      venv\\Scripts\\python -m pip install -r requirements.txt")
+    print("=" * 60)
 sampling_rate = model.sampling_rate
 
 if DO_COMPILE:
@@ -580,13 +687,20 @@ def _gen_core_impl(
     if seed is not None:
         rep["seed"] = int(seed)
 
-    gen_config = OmniVoiceGenerationConfig(
+    cfg_kw: Dict[str, Any] = dict(
         num_step=int(num_step or 32),
         guidance_scale=float(guidance_scale) if guidance_scale is not None else 2.0,
         denoise=bool(denoise) if denoise is not None else True,
         preprocess_prompt=bool(preprocess_prompt),
         postprocess_output=bool(postprocess_output),
     )
+    # 0.2.0+: the model's own fade/pad. Upstream #194 reports the built-in fade
+    # "sometimes adds artifact", and #204/#245 are clips losing their last word.
+    if PAD_DURATION and FEATURES["pad_duration"]:
+        cfg_kw["pad_duration"] = float(PAD_DURATION)
+    if FADE_DURATION and FEATURES["fade_duration"]:
+        cfg_kw["fade_duration"] = float(FADE_DURATION)
+    gen_config = OmniVoiceGenerationConfig(**cfg_kw)
 
     lang = language if (language and language != "Auto") else None
     kw: Dict[str, Any] = dict(text=syn_text, language=lang, generation_config=gen_config)
@@ -1281,7 +1395,8 @@ VOICES: Dict[str, Dict[str, Any]] = {}
 VOICES_LOCK = threading.Lock()
 NO_SAVED_VOICE = "— none —"
 
-_PERSISTED_VOICE_FIELDS = ("path", "ref_text", "baseline_wpm", "quality_score",
+_PERSISTED_VOICE_FIELDS = ("path", "ref_text", "prompt_version",
+                           "baseline_wpm", "quality_score",
                            "warnings", "owner", "created", "duration_sec",
                            "lufs", "snr_db",
                            # Who this voice belongs to and on what authority.
@@ -1335,6 +1450,59 @@ def _invalidate_voice_prompts():
         for v in VOICES.values():
             v["prompt"] = None
     _VOICE_CACHE.update(key=None, prompt=None, ref_text="")
+
+
+# --- built-voice persistence (omnivoice 0.2.1+) ---------------------------
+# Re-encoding a reference on every restart costs 50-200 ms per voice for a
+# result that has not changed since it was registered — and on this server
+# "restart" also means "after every OOM recovery". 0.2.1 added save/load for a
+# built prompt; where it exists we use it, and where it does not we rebuild.
+def _prompt_path(name: str) -> str:
+    return os.path.join(VOICES_DIR, _safe_name(name) + ".omniprompt")
+
+
+def _save_prompt(name: str, prompt) -> bool:
+    saver = getattr(prompt, "save", None)
+    if not callable(saver):
+        return False
+    try:
+        saver(_prompt_path(name))
+        with VOICES_LOCK:
+            if name in VOICES:
+                VOICES[name]["prompt_version"] = OMNIVOICE_VERSION
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not cache the built voice '%s': %s", name, e)
+        return False
+
+
+def _load_prompt(name: str):
+    """Return a previously built prompt, or None to rebuild it."""
+    path = _prompt_path(name)
+    if not os.path.exists(path):
+        return None
+    with VOICES_LOCK:
+        stored = (VOICES.get(name) or {}).get("prompt_version")
+    if stored and stored != OMNIVOICE_VERSION:
+        # A prompt built by a different library version is not worth trusting.
+        log.info("voice '%s' was built on omnivoice %s (now %s) — rebuilding",
+                 name, stored, OMNIVOICE_VERSION)
+        return None
+    try:
+        from omnivoice import VoiceClonePrompt
+    except Exception:  # noqa: BLE001 - older versions do not export it
+        return None
+    loader = getattr(VoiceClonePrompt, "load", None)
+    if not callable(loader):
+        return None
+    try:
+        prompt = loader(path)
+        log.info("voice '%s' restored from cache (no re-encode)", name)
+        return prompt
+    except Exception as e:  # noqa: BLE001
+        log.warning("cached voice '%s' could not be loaded (%s) — rebuilding",
+                    name, e)
+        return None
 
 
 def _unique_voice_name(base):
@@ -1488,11 +1656,18 @@ def get_voice_prompt(name):
     if not v:
         return None, ""
     if v.get("prompt") is None:
+        cached = _load_prompt(name)
+        if cached is not None:
+            with VOICES_LOCK:
+                v["prompt"] = cached
+            return cached, v.get("ref_text", "")
         prompt, ref_used = _build_prompt(v["path"], v.get("ref_text") or None)
         with VOICES_LOCK:
             v["prompt"] = prompt
             if not v.get("ref_text"):
                 v["ref_text"] = ref_used
+        if _save_prompt(name, prompt):
+            _save_voice_index()
     return v["prompt"], v.get("ref_text", "")
 
 
@@ -1527,6 +1702,9 @@ def delete_voice(name, owner=None):
         if p and os.path.exists(p) and os.path.normpath(
                 os.path.dirname(p)) == os.path.normpath(VOICES_DIR):
             os.remove(p)
+        cached = _prompt_path(name)
+        if os.path.exists(cached):
+            os.remove(cached)
     except Exception as e:  # noqa: BLE001
         log.warning("Could not delete voice clip: %s", e)
     _save_voice_index()
@@ -2524,6 +2702,9 @@ def _build_api():
             "vram": gpu_guard.snapshot(),
             "readiness": READY.as_dict(),
             "watermark": {"enabled": WATERMARK, **watermark.status()},
+            "omnivoice_version": OMNIVOICE_VERSION,
+            "omnivoice_outdated": OMNIVOICE_OUTDATED,
+            "features": FEATURES,
             "audit_log": AUDIT_LOG if AUDIT else None,
             "api_version": API_VERSION,
             **HEALTH.as_dict(),
@@ -2954,6 +3135,10 @@ if __name__ == "__main__":
                       "   <- point monitoring here")
             if WATERMARK:
                 print(f"  watermark:       {watermark.status()}")
+            _feat = ", ".join(k for k, v in FEATURES.items() if v) or "none"
+            print(f"  omnivoice {OMNIVOICE_VERSION} · features: {_feat}"
+                  + ("   <- OUTDATED, run pip install -r requirements.txt"
+                     if OMNIVOICE_OUTDATED else ""))
             print(f"  verify={'on' if VERIFY else 'off'} · "
                   f"normalize={NORMALIZE_LEVEL} · "
                   f"loudness={'on' if NORMALIZE_OUTPUT else 'off'} "
