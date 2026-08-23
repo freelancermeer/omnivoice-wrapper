@@ -532,3 +532,63 @@ were costing far more than the checking itself.
 The one large lever left is upstream **PR #239** (FlashInfer, "2.1x at batch
 size 1"), which needs `omnivoice` from git main rather than 0.2.1. It was
 measured on an H100; this card is Ampere. Not attempted here.
+
+
+---
+
+## FlashInfer: attempted, and it cannot run on Windows at all
+
+`RESEARCH.md` §8 held this out as the one large RTF lever left — upstream
+[PR #239](https://github.com/k2-fsa/OmniVoice/pull/239), "2-2.9x lossless
+speedup", 2.1x at batch size 1. It was tried on this machine. It is not
+available here, and the blocker is not OmniVoice.
+
+Three independent walls, in the order they were hit:
+
+1. **`flashinfer-jit-cache` publishes Linux wheels only.** Every file on the
+   cu128 index is `manylinux_2_28`, x86_64 and aarch64 alike. There is no
+   Windows build of any version.
+2. **`flashinfer-python` will not install either** — it requires
+   `nccl4py>=0.3.1`, which has no Windows distribution.
+3. **NCCL does not exist on Windows.** That is the root of (2), and it is not
+   something a wrapper can work around.
+
+So the install failed cleanly and `omnivoice` stayed at 0.2.1; nothing needed
+rolling back. **Do not budget for FlashInfer on this box.** The honest way to
+reach it is a Linux environment — WSL2 with CUDA passthrough on this same
+machine would qualify, and would also be worth measuring against the VRAM leak
+in upstream #199.
+
+## The RTF jitter has one cause, and it is not fifteen processes
+
+An earlier note in this document blamed "fifteen other processes" using the
+GPU. That was loose. Sampling `\GPU Engine(*)\Utilization Percentage` per
+process while a TTS load ran gives a much sharper answer:
+
+| process | engine | avg % |
+|---|---|---:|
+| python (this server) | 3d | 32.7 |
+| **parsecd** | 3d | **13.4** |
+| **parsecd** | videoencode (NVENC) | **11.3** |
+| claude | 3d | 0.8 |
+
+**Parsec alone is taking ~25 % of the GPU**, continuously — desktop capture on
+the 3d engine plus NVENC encoding. Everything else on the desktop (Edge
+WebView, WPS, Claude, explorer, Start Menu) is rounding error at under 1 %.
+
+That is the whole jitter story: identical 60-word requests spread 4.17-5.51 s
+because a quarter of the card is being spent encoding video for a remote
+session. Closing Parsec when nobody is remoting into the box is the single
+cheapest RTF win available on this machine — larger than anything left in the
+code.
+
+Caveat worth stating plainly: if the box is *administered* over Parsec, closing
+it costs the operator their access. It is a deployment decision, not a code
+change.
+
+## Steps stay at 16
+
+A `num_step` sweep was offered and declined — 16 gives the voice quality this
+product is being sold on. Recorded here so nobody re-opens it: the RTF numbers
+in this document are all at **16 steps**, and lowering steps was not traded
+against quality because the quality was judged acceptable as-is.
