@@ -87,9 +87,12 @@ models are local, and the `.bat` files set `HF_HUB_OFFLINE=1`.
    all using the same voice.
 3. **Settings (optional)** — language, quality steps (16 = fast, 32+ = better),
    speed, guidance, duration.
-4. **Render queue** — jobs process one at a time with live status, time · RTF ·
-   wpm, the exact voice transcript used, and **any warning about what came out**
-   (words dropped, a leaked tail removed, loudness that could not be reached).
+4. **Render queue** — jobs process one at a time. Each card carries its own
+   metrics row — **RTF** (green under 1.0, amber over), audio length, time taken,
+   wpm, LUFS, chunk count — plus the exact voice transcript used and **any
+   warning about what came out** (words dropped, a leaked tail removed, loudness
+   that could not be reached). The header shows the **average and best RTF**
+   across the queue, so the number you tune is always on screen.
 5. **Save & downloads** — every render auto-saves; plus **📦 Zip all completed**.
 6. **🛑 Shut down PC when the queue finishes** — optional.
 

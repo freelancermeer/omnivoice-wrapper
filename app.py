@@ -415,7 +415,8 @@ READY = gpu_guard.Readiness(stale_after=SELFTEST_STALE)
 STARTED_AT = time.time()
 METRICS = {"generations": 0, "verify_failures": 0, "verify_skipped": 0,
            "tail_trims": 0, "regenerations": 0, "oom": 0,
-           "unknown_params": {}, "idempotent_replays": 0}
+           "unknown_params": {}, "idempotent_replays": 0,
+           "audio_sec_total": 0.0, "gen_sec_total": 0.0}
 METRICS_LOCK = threading.Lock()
 
 
@@ -731,6 +732,13 @@ def _gen_core_impl(
 
     notes.append(f"{gen_time:.1f}s for {audio_dur:.1f}s audio · RTF {rtf:.3f}"
                  f" · {measured_wpm:.0f} wpm")
+    # Totals, so /api/metrics can report the RTF across a whole day rather than
+    # the average of per-clip ratios (short clips would dominate that).
+    with METRICS_LOCK:
+        METRICS["audio_sec_total"] = round(
+            METRICS.get("audio_sec_total", 0.0) + audio_dur, 2)
+        METRICS["gen_sec_total"] = round(
+            METRICS.get("gen_sec_total", 0.0) + gen_time, 2)
 
     if WATERMARK and len(waveform_f):
         # Generated audio only. A customer's own recording is their real voice
@@ -1134,6 +1142,16 @@ def _jobs_html():
         f'<span class="vq-pill">{ico} {counts.get(st, 0)} {st}</span>'
         for st, ico in pill_defs
     )
+    # RTF is the number this gets judged on, so it belongs in the header rather
+    # than buried at the end of a line that gets ellipsised away.
+    rtfs = [(j.get("report") or {}).get("rtf") for j in jobs
+            if j["status"] == "Done"]
+    rtfs = [r for r in rtfs if r]
+    if rtfs:
+        avg = sum(rtfs) / len(rtfs)
+        cls = "vq-pill-good" if avg < 1.0 else "vq-pill-slow"
+        pills += (f'<span class="vq-pill {cls}">⚡ avg RTF {avg:.3f}</span>'
+                  f'<span class="vq-pill {cls}">best {min(rtfs):.3f}</span>')
     header = f'<div class="vq-pills">{pills}</div>' + _gpu_line()
 
     if not jobs:
@@ -1146,12 +1164,37 @@ def _jobs_html():
         cls = _BADGE_CLASS.get(status, "badge-queued")
         icon = _STATUS_ICON.get(status, "")
         name = html_mod.escape(j["project"])
-        info = html_mod.escape(j["info"] or "")
+        rep = j.get("report") or {}
         script_preview = html_mod.escape((j["params"]["script"] or "")[:60])
         cloned = bool(j["params"].get("clone_prompt"))
         voice = "🎤 cloned" if cloned else "🎛️ designed"
-        detail = info if info else (f"{script_preview}…" if script_preview else "")
-        sub = f"{voice} · {detail}" if detail else voice
+        # The timing note moves to its own uncropped row below; keep the rest.
+        notes = "; ".join(n for n in rep.get("notes", []) if "RTF" not in n)
+        detail = notes or (f"{script_preview}…" if script_preview else "")
+        if not detail and j["info"]:
+            detail = j["info"]
+        sub = f"{voice} · {html_mod.escape(detail)}" if detail else voice
+
+        chips = []
+        rtf = rep.get("rtf")
+        if rtf:
+            # < 1.0 means faster than real time.
+            chips.append(f'<span class="vq-chip '
+                         f'{"vq-chip-good" if rtf < 1.0 else "vq-chip-slow"}">'
+                         f'⚡ RTF {rtf:.3f}</span>')
+        if rep.get("audio_sec"):
+            chips.append(f'<span class="vq-chip">🕑 {rep["audio_sec"]:.1f}s audio</span>')
+        if rep.get("gen_sec"):
+            chips.append(f'<span class="vq-chip">⚙️ {rep["gen_sec"]:.1f}s to make</span>')
+        if rep.get("wpm"):
+            chips.append(f'<span class="vq-chip">🗣️ {rep["wpm"]:.0f} wpm</span>')
+        _lufs = (rep.get("loudness") or {}).get("out_lufs")
+        if _lufs is not None:
+            chips.append(f'<span class="vq-chip">🔊 {_lufs:.1f} LUFS</span>')
+        if rep.get("chunks", 0) > 1:
+            chips.append(f'<span class="vq-chip">🧩 {rep["chunks"]} chunks</span>')
+        metrics_line = (f'<div class="vq-metrics">{"".join(chips)}</div>'
+                        if chips else "")
         ref_used = html_mod.escape((j.get("ref_used") or "")[:60])
         ref_line = (f'<div class="vq-ref">🗣️ voice: "{ref_used}…"</div>'
                     if ref_used else "")
@@ -1170,7 +1213,8 @@ def _jobs_html():
             f'<div class="vq-left">'
             f'<span class="vq-id">#{j["id"]}</span>'
             f'<div class="vq-meta"><div class="vq-name">{name}</div>'
-            f'<div class="vq-sub">{sub}</div>{ref_line}{warn_line}{dl}</div>'
+            f'<div class="vq-sub">{sub}</div>'
+            f'{metrics_line}{ref_line}{warn_line}{dl}</div>'
             f'</div>'
             f'<div class="vq-right">'
             f'<span class="vq-badge {cls}">{icon} {status}</span>'
@@ -1985,6 +2029,16 @@ _CSS = """
 .vq-pills {display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;}
 .vq-pill {padding:5px 12px; border-radius:999px; font-size:0.85em; font-weight:600;
   background:var(--block-background-fill); border:1px solid var(--border-color-primary);}
+.vq-pill.vq-pill-good {background:#dcfce7; color:#166534; border-color:#86efac;}
+.vq-pill.vq-pill-slow {background:#fef3c7; color:#92400e; border-color:#fcd34d;}
+/* Metrics get their own row and are never ellipsised: RTF used to sit at the
+   end of a truncated line, which is why nobody ever saw it. */
+.vq-metrics {display:flex; flex-wrap:wrap; gap:5px; margin-top:5px;}
+.vq-chip {font-size:0.72em; font-weight:600; padding:2px 8px; border-radius:7px;
+  background:var(--background-fill-secondary, rgba(127,127,127,0.12));
+  color:var(--body-text-color-subdued); white-space:nowrap;}
+.vq-chip.vq-chip-good {background:#dcfce7; color:#166534;}
+.vq-chip.vq-chip-slow {background:#fef3c7; color:#92400e;}
 .vq-gpu {font-size:0.76em; color:var(--body-text-color-subdued); margin-bottom:10px;}
 .vq-board {display:flex; flex-direction:column; gap:10px; max-height:62vh; overflow-y:auto;
   padding-right:4px;}
@@ -1998,9 +2052,9 @@ _CSS = """
   min-width:34px; flex-shrink:0;}
 .vq-meta {min-width:0; flex:1 1 auto;}
 .vq-name {font-weight:600; font-size:1.05em; white-space:nowrap; overflow:hidden;
-  text-overflow:ellipsis; max-width:280px;}
+  text-overflow:ellipsis; max-width:360px;}
 .vq-sub {font-size:0.8em; color:var(--body-text-color-subdued); white-space:nowrap;
-  overflow:hidden; text-overflow:ellipsis; max-width:300px; margin-top:2px;}
+  overflow:hidden; text-overflow:ellipsis; max-width:420px; margin-top:2px;}
 .vq-ref {font-size:0.76em; color:var(--body-text-color-subdued); font-style:italic;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:300px;
   margin-top:2px; opacity:0.85;}
@@ -2440,6 +2494,9 @@ def _build_api():
         with METRICS_LOCK:
             snap = dict(METRICS)
             snap["unknown_params"] = dict(snap.get("unknown_params", {}))
+        audio_total = snap.get("audio_sec_total") or 0.0
+        snap["rtf_overall"] = (round(snap.get("gen_sec_total", 0.0) / audio_total, 4)
+                               if audio_total > 0 else None)
         snap.update({"queue_depth": _queue_depth(),
                      "uptime_s": round(time.time() - STARTED_AT, 1),
                      "vram": gpu_guard.snapshot(), **HEALTH.as_dict()})
@@ -2667,6 +2724,8 @@ def _build_api():
                 "verified": rep.get("verified", False),
                 "verification": rep.get("diffs", []),
                 "wpm": rep.get("wpm"), "loudness": rep.get("loudness"),
+                "rtf": rep.get("rtf"), "gen_sec": rep.get("gen_sec"),
+                "audio_sec": rep.get("audio_sec"), "chunks": rep.get("chunks"),
                 "normalized_text": rep.get("normalized_text"),
                 "download_url": (f"/api/jobs/{j['id']}/download" if j["file"] else None)}
 

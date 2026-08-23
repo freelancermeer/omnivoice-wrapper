@@ -112,7 +112,7 @@ into a `400` once you know nobody is sending them.
 | `GET /api/ready` | **did the model actually produce words recently?** | **load balancer, and before starting a batch** |
 | `GET /api/selftest` | generate four words *right now* | manual check; `409` if busy |
 | `GET /api/health` | everything, including VRAM | dashboards |
-| `GET /api/metrics` | counters (generations, OOMs, verify failures, tail trims, replays) | monitoring |
+| `GET /api/metrics` | counters (generations, OOMs, verify failures, tail trims, replays) plus `rtf_overall` | monitoring |
 
 `/api/ready` returns **503 + `Retry-After`** when the last self-test failed or
 is stale. This is the one to trust: a server whose GPU is dead still answers
@@ -155,6 +155,7 @@ Headers on the reply:
 | Header | Meaning |
 |---|---|
 | `X-Duration-Sec`, `X-RTF` | unchanged, always present |
+| `X-WPM` | measured speaking rate |
 | `X-WPM` | measured speaking rate |
 | `X-LUFS`, `X-True-Peak-dB` | measured loudness of what you got |
 | `X-Verified` | `true` if the clip was transcribed back and checked |
@@ -203,7 +204,8 @@ When something did go wrong, `verification` names it:
 Same fields (no `format` on submit; choose it at download). The job shares the
 Studio's queue, so async work and the UI cannot fight over the GPU.
 `GET /api/jobs` lists recent jobs. Job status carries `warnings`, `verified`,
-`verification`, `wpm`, `loudness` and `normalized_text`.
+`verification`, `wpm`, `rtf`, `gen_sec`, `audio_sec`, `chunks`, `loudness` and
+`normalized_text`.
 
 ### 3.5 `POST /api/voices` — register a reusable voice
 
