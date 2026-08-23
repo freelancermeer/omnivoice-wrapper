@@ -592,3 +592,92 @@ A `num_step` sweep was offered and declined — 16 gives the voice quality this
 product is being sold on. Recorded here so nobody re-opens it: the RTF numbers
 in this document are all at **16 steps**, and lowering steps was not traded
 against quality because the quality was judged acceptable as-is.
+
+
+---
+
+## "The UI is full of bugs" was one instance too many
+
+Reported as a Gradio problem. It was not Gradio, and the log said so:
+
+```
+ERROR: [Errno 10048] ... bind on address ('0.0.0.0', 7860) ...
+ERROR: [Errno 10048] ... bind on address ('0.0.0.0', 8001) ...
+Port 7860 busy, trying 7861 ...
+```
+
+`run.bat` was started while a server was already running. What that produced:
+
+* the second instance **could not bind the API port**, so `/api` was dead for
+  it — while its own banner still printed `API (local): http://127.0.0.1:8001`
+  as though it worked;
+* the UI walked to **7861**, so the address in the banner was not the one being
+  opened;
+* and worst, **a second 3.3 GB model had already been loaded** onto an 8 GB
+  card that was now hosting two of them.
+
+Everything after that looks like a buggy UI.
+
+### Fixed: it now refuses to be the second instance
+
+`_refuse_if_already_running()` runs **before the model loads** — which is the
+whole point, since by the time the sockets are bound the expensive and damaging
+half has already happened. Measured: the second start now exits in **8.5 s
+having allocated nothing**, with VRAM unchanged at 4224 MB.
+
+```
+==============================================================
+  OmniVoice is ALREADY RUNNING on port 8001.
+  Nothing was started, and no second model was loaded.
+  Open the running one:  http://127.0.0.1:7860
+  To restart instead, close the other window first.
+==============================================================
+```
+
+A port held by something that is *not* OmniVoice gets a different message
+pointing at `OMNIVOICE_API_PORT`.
+
+### Fixed: the banner no longer advertises an API that failed to bind
+
+`_start_api_server` logged the bind failure at warning level and carried on.
+The banner then printed the API URLs regardless. That is precisely how a
+half-dead instance passes for a working one, so the failure is now **printed**,
+loudly, saying the UI still works and anything calling `/api` will not.
+
+### The UI itself was exercised end to end and is fine
+
+Driven through a real browser: voice dropdown repopulated with the three
+re-registered voices (`demo.load` does its job), voice selected, sample and
+transcript loaded, script queued, rendered, and the finished card showed
+`RTF 0.242 · 9.1 s audio · 2.2 s to make · 170 wpm · -20.0 LUFS`. The clip
+verified at **word accuracy 1.0000**.
+
+That clip is also a live test of today's clock-time fix: the script said
+"4:30", Whisper wrote "4.30", and the verifier scored it clean instead of
+inventing three dropped words.
+
+**One real quirk, not worth fighting.** Gradio's `gr.Timer` pauses while the
+browser tab is hidden, so a queue left in a background tab looks frozen —
+counters and cards both stale — and catches up the moment the tab is focused
+again. Confirmed by faking `document.visibilityState`: the board went from
+"1 Queued / Processing" to "0 Queued / 1 Done" immediately. Nothing is lost,
+rendering continues server-side, and the display self-corrects. Worth knowing
+before someone reports it as a hang.
+
+## Voices were rebuilt from scratch
+
+All eleven entries — the original seven from the old code plus four created
+during testing — were deleted, and the three real voices re-registered from
+their original 10.000 s clips so the repair ran fresh rather than inheriting
+anything. The old `voices/` folder was copied to `voices_backup_<timestamp>/`
+first, because those clips are the only copies that exist.
+
+| voice | from | to | quality | wpm | note |
+|---|---|---|---|---|---|
+| RVoiceover_1 | 10.00 s | 9.82 s | 1.00 | 147 | clean |
+| RVoiceover_2 | 10.00 s | 9.18 s | 0.85 | 196 | cut back from mid-word |
+| RVoiceover_3 | 10.00 s | 7.52 s | 0.85 | 160 | the "forcing" clip |
+
+Names are plain again — no `_2` suffixes. Re-verified on the new library:
+35 acceptance checks pass, and the ten-clip batch audits **0 added, 0 dropped,
+10/10 clean**.

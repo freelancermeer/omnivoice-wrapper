@@ -387,6 +387,57 @@ def audit_generation(text, rep, voice_id=None, owner=None, project=None,
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
+def _refuse_if_already_running() -> None:
+    """Stop before loading a second copy of the model onto the same GPU.
+
+    Double-clicking run.bat while a server is already up used to produce a
+    working-looking mess: the API could not bind, so that half was silently
+    dead, the UI walked to the next free port so the address in the banner was
+    not the one being opened, and — worst of all — a second 3.3 GB model had
+    already been loaded onto an 8 GB card that was now hosting two of them.
+    Everything after that looks like "the UI is buggy".
+
+    The check has to happen here rather than next to the socket code, because
+    by the time the ports are bound the expensive, damaging half has happened.
+    """
+    if not _env_flag("OMNIVOICE_API"):
+        return
+    port = int(os.environ.get("OMNIVOICE_API_PORT", "8001"))
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(0.6)
+    try:
+        busy = probe.connect_ex(("127.0.0.1", port)) == 0
+    finally:
+        probe.close()
+    if not busy:
+        return
+
+    ours = False
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/live", timeout=2) as r:
+            ours = r.status == 200
+    except Exception:  # noqa: BLE001 - anything else is still a port clash
+        pass
+
+    print("=" * 62)
+    if ours:
+        print(f"  OmniVoice is ALREADY RUNNING on port {port}.")
+        print("  Nothing was started, and no second model was loaded.")
+        print(f"  Open the running one:  http://127.0.0.1:"
+              f"{os.environ.get('GRADIO_SERVER_PORT', '7860')}")
+        print("  To restart instead, close the other window first.")
+    else:
+        print(f"  Port {port} is in use by something that is not OmniVoice.")
+        print("  Free it, or choose another:  set OMNIVOICE_API_PORT=8002")
+    print("=" * 62)
+    sys.exit(1)
+
+
+_refuse_if_already_running()
+
+
 if torch.cuda.is_available():
     device_map = "cuda"
     dtype = torch.float16
@@ -3206,12 +3257,25 @@ def _build_api():
     return api
 
 
+API_UP = threading.Event()
+
+
 def _start_api_server():
     try:
         import uvicorn
-        uvicorn.run(_build_api(), host="0.0.0.0", port=API_PORT, log_level="warning")
+        API_UP.set()
+        uvicorn.run(_build_api(), host="0.0.0.0", port=API_PORT,
+                    log_level="warning")
     except Exception as e:  # noqa: BLE001
-        log.warning("API server failed to start: %s", e)
+        API_UP.clear()
+        # Printed, not just logged: the banner below advertises this port, and
+        # a caller reading "API (local): ..." while nothing is listening there
+        # is exactly how a broken second instance passes for a working one.
+        print("=" * 62)
+        print(f"  API DID NOT START on port {API_PORT}: {e}")
+        print("  The UI still works; anything calling /api will not.")
+        print("  Usually another OmniVoice is already running.")
+        print("=" * 62)
 
 
 def _lan_ips():

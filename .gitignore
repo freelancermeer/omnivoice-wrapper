@@ -68,3 +68,6 @@ sample_audit.json
 # tools/verify_external.py output — contains transcripts, not secrets, but it
 # is a run artifact and is regenerated every time.
 external_check.json
+
+# Timestamped copies made before deleting voices. Local safety net, not code.
+voices_backup_*/
