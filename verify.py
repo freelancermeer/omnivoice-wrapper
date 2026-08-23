@@ -111,7 +111,7 @@ def words(text: str) -> List[str]:
     return [w for w in (tok.strip("'") for tok in t.split()) if w]
 
 
-def word_diff(sent_text: str, spoken_text: str) -> Dict:
+def _word_diff_once(sent_text: str, spoken_text: str) -> Dict:
     """What was sent vs what was said — order and count both respected.
 
     Returns:
@@ -175,6 +175,105 @@ def word_diff(sent_text: str, spoken_text: str) -> Dict:
         "word_accuracy": round(matched / max(len(sent), 1), 4),
         "ok": not hard_dropped and not hard_inserted,
     }
+
+
+# Whisper writes clock times with a full stop: "7:45" comes back as "7.45",
+# which reads as a decimal and expands to "seven point four five" against the
+# script's "seven forty-five". Measured on the GPU box: three dropped words and
+# seven inserted ones on a clip where the model said exactly the right thing.
+_CLOCK_DOT_RE = re.compile(r"\b([01]?\d|2[0-3])\.([0-5]\d)\b")
+
+
+# A transcriber that has just written "$4.2 million" will write the next bare
+# "3 million" as "$3 million" too, because the context is money — and then the
+# expansion adds a "dollars" the script never contained. Measured on the GPU
+# box, and both Whisper and AssemblyAI made exactly the same inference on the
+# same clip, which is what says it is notation rather than the model speaking.
+_CURRENCY_MARK_RE = re.compile(r"[$£€¥]")
+
+
+def _errors(diff: Dict) -> int:
+    """How wrong a reading is, counting both directions.
+
+    `word_accuracy` is matched-over-sent, so it cannot see an insertion at all
+    — a clip that says every word it was sent plus a spurious "dollars" still
+    scores 1.000. Choosing between two readings therefore has to count what was
+    added as well as what went missing.
+    """
+    return len(diff["hard_dropped"]) + len(diff["hard_inserted"])
+
+
+def _without_nth(text: str, regex, n: int) -> str:
+    """The same text with only the nth match of `regex` removed."""
+    out, last = [], 0
+    for k, m in enumerate(regex.finditer(text)):
+        if k == n:
+            out.append(text[last:m.start()])
+            last = m.end()
+            break
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _best_currency_reading(sent_text: str, spoken: str, diff: Dict) -> Dict:
+    """Drop the currency marks the transcriber inferred, one at a time.
+
+    Removing all of them is no better than keeping all of them when the script
+    genuinely contains one: the error simply changes from an inserted
+    "dollars" to a dropped one. Only the *spurious* mark should go, so try each
+    one and keep whichever removal actually reduces the error count, then look
+    again. Greedy, bounded, and it can only ever improve the match.
+    """
+    for _ in range(_MAX_CURRENCY_TRIES):
+        n = len(_CURRENCY_MARK_RE.findall(spoken))
+        if not n:
+            break
+        best, best_text = diff, None
+        for i in range(min(n, _MAX_CURRENCY_TRIES)):
+            cand = _without_nth(spoken, _CURRENCY_MARK_RE, i)
+            alt = _word_diff_once(sent_text, cand)
+            if _errors(alt) < _errors(best):
+                best, best_text = alt, cand
+        if best_text is None:
+            break
+        diff, spoken = best, best_text
+        if diff["ok"]:
+            break
+    return diff
+
+
+_MAX_CURRENCY_TRIES = 4
+
+
+def _readings(spoken_text: str):
+    """Other defensible ways to read the same transcript."""
+    if _CLOCK_DOT_RE.search(spoken_text):
+        yield _CLOCK_DOT_RE.sub(r"\1:\2", spoken_text)
+
+
+def word_diff(sent_text: str, spoken_text: str) -> Dict:
+    """What was sent vs what was said, reading the transcriber charitably.
+
+    Where the transcriber's notation is ambiguous, every defensible reading is
+    scored and the best one wins. Only a reading that *improves* the match is
+    accepted, so this can remove a false alarm but can never invent a clean
+    result: a genuine decimal stays a decimal, because reading it as a clock
+    time would not match the script either, and a "dollars" the model really
+    failed to say cannot be recovered by deleting a currency symbol that is
+    not in the transcript.
+    """
+    diff = _word_diff_once(sent_text, spoken_text)
+    if diff["ok"] or not spoken_text:
+        return diff
+    for candidate in _readings(spoken_text):
+        alt = _word_diff_once(sent_text, candidate)
+        if _errors(alt) < _errors(diff):
+            diff = alt
+            if diff["ok"]:
+                return diff
+    if not diff["ok"] and _CURRENCY_MARK_RE.search(spoken_text):
+        diff = _best_currency_reading(sent_text, spoken_text, diff)
+    return diff
 
 
 def passed(diff: Dict, min_accuracy: float = 0.995) -> bool:

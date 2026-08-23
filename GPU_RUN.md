@@ -196,6 +196,81 @@ that is enough so far.
 
 ---
 
+## Long-form, which is what this is actually sold for
+
+A 545-word script (non-repeating prose, numbers and currency in it) through
+`POST /api/tts`:
+
+| | |
+|---|---|
+| audio produced | **203.3 s** (3 min 23 s) from 61.6 s of wall time |
+| RTF | 0.300, **verified** |
+| words sent / spoken | 545 / 546 |
+| **word accuracy** | **0.9982** |
+| real drops | **0** |
+| trailing artefact (reference bleed) | **none** |
+| VRAM delta | +0 MB allocated, +0 MB reserved |
+
+A 287-second (4 min 47 s) clip behaved the same: `X-Verified: true`, +8 MB
+allocated, +0 MB reserved. Neither of these could have been verified at all
+before the 30-second fix above.
+
+Two things came back on the 545-word clip, and both are worth knowing about:
+
+* One genuine extra word — "dollars", where the script said "ninety million"
+  and the model said "ninety million dollars". That is the stochastic behaviour
+  the docs promise will never fully go away. The point is that it arrived as a
+  warning on the response rather than as a customer complaint.
+* `theatre` heard as `theater`, filed as a pronunciation note. Along with
+  `authorisation` → `authorization` in the batch audit, that is a pattern: if
+  your scripts use **British spelling, expect pronunciation notes**. They are
+  cosmetic — no regeneration is spent on them — but they will appear.
+
+### RTF grows with clip length, because verification does
+
+| clip length | RTF verified |
+|---|---|
+| ~73 s | 0.203 |
+| ~203 s | 0.300 |
+| ~287 s | 0.277 |
+
+Generation itself is flat; Whisper's long-form pass is what scales. So budget
+**~0.20 for clips around a minute and ~0.29 for multi-minute clips**, verified.
+
+---
+
+## The decision that was taken
+
+**Verification stays on.** RTF 0.151 → 0.203 is the price, and it buys a server
+that cannot drop a word silently. Two things make that cheaper than it looks:
+regenerations went from 25-in-49 to 0, so the wasted work that used to sit on
+top of verification is gone; and the failure it prevents costs a re-cut video,
+not a re-render.
+
+`OMNIVOICE_VERIFY=0` remains the lever if a deadline needs it, with
+`tools/audit_batch.py` as the after-the-fact check.
+
+FlashInfer was deliberately **not** attempted: 0.2.1 has just been verified end
+to end, and moving to git main would give that up for a speedup that is
+unmeasured on Ampere. Watermarking is likewise still untouched.
+
+---
+
+## Housekeeping for whoever runs this next
+
+Re-registering a voice creates a **new** id rather than overwriting, so the
+library now holds both generations:
+
+| keep | delete when convenient |
+|---|---|
+| `RVoiceover_1_2`, `RVoiceover_2_2`, `RVoiceover_3_2` | `RVoiceover_1`, `RVoiceover_2`, `RVoiceover_3` |
+
+The originals still carry the pre-fix `ref_text` — `RVoiceover_3`'s still ends
+on "forcing". They were left in place rather than deleted, but **do not pick
+them for real work**: they are the broken references, kept only as evidence.
+
+---
+
 ## Stability
 
 `tools/acceptance.py --voice RVoiceover_3_2`: **35 passed, 0 failed, 1 skipped.**
@@ -273,3 +348,187 @@ A plain terminate left the process holding port 8001 during this session, and a
 of measurements before it was caught. Confirm with
 `netstat -ano | findstr :8001` that the port is free before starting the next
 run.
+
+
+---
+
+# Second session — making verification cheap, and checking it against a
+# second transcriber
+
+Same machine, same day. The question this time was the one left open above:
+**RTF matters, so can verification cost less rather than be switched off?**
+The answer turned out to be yes, and three more false alarms fell out of it.
+
+## The verifier's ASR was running in its slowest possible mode
+
+Whisper can read a long clip two ways. The wrapper used the sequential
+long-form path (`return_timestamps=True`), which decodes one 30 s window after
+another. The pipeline will instead take the windows as a **batch**.
+
+Measured on a 203 s clip, same model, same weights (`bench_asr.py`):
+
+| mode | time | realtime factor | words |
+|---|---:|---:|---:|
+| sequential, timestamps (was) | 10.81 s | 18.8x | 543 |
+| chunked, batch=4 | 5.57 s | 36.5x | 543 |
+| chunked, batch=8 (now default) | 5.00 s | 40.7x | 543 |
+| chunked, batch=16 | 4.12 s | 49.4x | 543 |
+
+Word accuracy of every batched result against the sequential one: **1.0000,
+zero dropped, zero inserted.** This is free speed, not a quality trade.
+
+The per-chunk verification loop had the same shape — one model call per chunk,
+each waiting for the last — and now issues a single batched call up front
+(`_transcribe_many`). Both fall back to the old path if the build cannot do it.
+
+**Long-form RTF went 0.300 to 0.226** on an identical 545-word script, wall
+time 61.6 s to 46.3 s, with byte-identical warnings. `OMNIVOICE_ASR_BATCH`
+tunes it; VRAM peak rises about 1.4 GB at batch=8, which this card has.
+
+## Three more false alarms, each costing a real regeneration
+
+### 7. Whisper writes clock times with a full stop
+
+`7:45` comes back as `7.45`, which reads as a decimal and expands to "seven
+point four five" against the script's "seven forty-five". One clip scored
+**three dropped words and seven inserted ones** while having said every word
+correctly — and paid for a regeneration: RTF **0.548**, against 0.244 for the
+same clip once fixed.
+
+`verify.word_diff` now scores the alternative reading too and keeps whichever
+matches better. It can only ever remove a false alarm: a genuine decimal is not
+improved by reading it as a clock time, so it stays a decimal.
+
+### 8. A currency symbol the transcriber inferred
+
+Given "$4.2 million" earlier in a sentence, a transcriber writes the following
+bare "3 million" as "$3 million" — and the expansion adds a "dollars" the
+script never contained. That cost a regeneration too (RTF 0.353 against 0.183).
+
+What settled it as notation rather than the model speaking: **Whisper and
+AssemblyAI independently made the same inference on the same clip.**
+
+Removing every currency mark is no better than keeping them all when the script
+genuinely contains one — the error just changes from an inserted "dollars" to a
+dropped one. So they are removed one at a time, greedily, keeping only a removal
+that reduces the error count. A "dollars" the model really failed to say is
+still caught, including when one of two is dropped.
+
+### A metric bug found while fixing those two
+
+`word_accuracy` is matched-over-sent, so **it cannot see an insertion at all** —
+a clip that says every word it was sent plus a spurious "dollars" scores 1.000.
+Choosing between two readings on accuracy alone therefore never fired for the
+currency case. `_errors()` counts both directions.
+
+## Checked against a completely different transcriber
+
+The built-in verifier reads generated audio with Whisper, which means one model
+marking its own homework: if Whisper mishears the same word the model
+mispronounced, the two errors cancel. `tools/verify_external.py` sends the same
+clips to AssemblyAI and diffs both with the same `verify.word_diff`.
+
+Ten fresh clips (`tools/sample_scripts.json`, deliberately varied — plain
+narration, currency, proper nouns, clock times, a two-word line, a long literary
+sentence):
+
+| | clean | mean accuracy |
+|---|---:|---:|
+| Whisper (built in) | **10/10** | 0.9952 |
+| AssemblyAI (independent) | 9/10 | 0.9928 |
+| the two agree | **9/10** | |
+
+The single disagreement is AssemblyAI's own error: it heard "lift the **cover**
+away from you" as "lift the **COVID** away from you". Our verifier was right.
+
+Before the two fixes above, the same batch scored Whisper 9/10 and AssemblyAI
+7/10 with agreement on 8/10 — and both flagged the same spurious "dollars".
+
+**Note:** this uploads audio to a third party. The key is read from
+`ASSEMBLYAI_API_KEY` and is never written to a file.
+
+## The reference repair, tested on a voice that never existed before
+
+A clip was cut at exactly 10.000 s — the same stopwatch cut that caused the
+original 218-word bug — and registered as a new voice:
+
+```
+duration_sec : 8.74s  (from 10.00s)
+ref_text     : ...ear that the committee had lost control of its own schedule.
+WARNING      : your clip stopped while you were still speaking, so it was cut
+               back to the last finished phrase (8.5s of 10.0s kept)
+```
+
+Three clips generated from it: **0/3 showed any reference bleed.** The
+protection is automatic on every registration, not something done by hand to
+the three original voices.
+
+## What the API does when several callers arrive at once
+
+| | per-clip RTF | outcome |
+|---|---|---|
+| 1 request alone | 0.234 | — |
+| 4 at the same instant | 0.212–0.222 | 4/4 succeeded |
+| 8 at the same instant | 0.210–0.221 | 8/8 succeeded |
+
+**Per-clip RTF does not move under load, and nothing is refused.** Throughput
+RTF across 8 simultaneous callers was 0.217, against 0.234 for one alone — the
+queue costs nothing. What grows is waiting: the eighth caller waited 19.4 s
+behind seven clips.
+
+`POST /api/tts/async` returns in **0.01 s** and the client polls
+`GET /api/jobs/{id}`; five jobs finished in 10.3 s. That is the right path for
+anything submitting more than one clip. It intentionally does not take
+`format` — the warning saying so is the unknown-parameter mechanism working.
+
+## RTF variance is this desktop, not the code
+
+Every ladder run showed one slow rung per repeat — a 60-word clip rendering in
+4.16 s and then 7.58 s on identical input.
+
+The first hypothesis was the 120 s readiness self-test stealing the GPU slot.
+**That was wrong.** The probe was made idle-only anyway (a real request that
+succeeded seconds ago is better evidence than a synthetic one, so running it on
+a busy server is not merely redundant but harmful) — and the outliers survived
+unchanged.
+
+The actual cause: **fifteen other processes are using this GPU** — explorer,
+two Edge WebView instances, Parsec, WPS Office, Claude desktop, Phone Link,
+Search, Start Menu. Twelve identical 60-word requests spread 4.17–5.51 s, with
+temperature climbing 52 to 75 °C and clocks steady at ~1875 MHz, so nothing is
+throttling; the contention simply lands mid-run.
+
+**The numbers in this document are a floor, not a ceiling.** On a machine
+without a desktop on it, expect the fast end of each range.
+
+## The machine shut down by itself, twice
+
+Not the app. The queue's optional shutdown runs `shutdown /s /t 60`, which logs
+a clean **Event 1074**. What the log actually shows is **Event 41** ("rebooted
+without cleanly shutting down") and **6008** ("the previous system shutdown was
+unexpected"), at 12:34 AM on 24 Aug and again at 2:34 AM on 23 Aug — both under
+sustained GPU load.
+
+No WHEA errors, and the GPU reads 49 °C at idle. Kernel-Power 41 with no
+hardware error logged and a cool card points at **power delivery** rather than
+temperature: the 3060 Ti's transient spikes are large, and a marginal PSU trips
+under sustained inference. Worth trying `nvidia-smi -pl 150` from an
+administrator prompt before a long batch; it caps the spikes for very little
+RTF.
+
+## Where RTF stands now
+
+| | RTF |
+|---|---:|
+| long-form, 203 s clip, verified | **0.221–0.230** (was 0.300) |
+| 240-word clips, verified | **0.178–0.185** (was 0.198–0.208) |
+| pooled 60 words and up, verified | **0.211** |
+| unverified, for reference | 0.151 |
+
+Verification now costs roughly **25–40 %** depending on clip length, down from
+a straight 35 % — and the three false-alarm fixes remove regenerations that
+were costing far more than the checking itself.
+
+The one large lever left is upstream **PR #239** (FlashInfer, "2.1x at batch
+size 1"), which needs `omnivoice` from git main rather than 0.2.1. It was
+measured on an H100; this card is Ampere. Not attempted here.

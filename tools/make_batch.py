@@ -66,11 +66,18 @@ def main():
     ap.add_argument("--manifest", default="manifest.json")
     ap.add_argument("--steps", default="16")
     ap.add_argument("--limit", type=int, default=0, help="only the first N")
+    ap.add_argument("--scripts", help="JSON list of scripts to use instead "
+                    "of the built-in batch (e.g. tools/sample_scripts.json)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     headers = {"X-API-Key": args.key} if args.key else {}
-    scripts = SCRIPTS[: args.limit] if args.limit else SCRIPTS
+    scripts = SCRIPTS
+    if args.scripts:
+        with open(args.scripts, encoding="utf-8") as f:
+            scripts = json.load(f)
+    if args.limit:
+        scripts = scripts[: args.limit]
 
     manifest, rtfs, warned = [], [], 0
     t_start = time.time()

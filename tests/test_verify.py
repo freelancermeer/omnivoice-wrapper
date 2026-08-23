@@ -215,3 +215,67 @@ def test_a_different_number_is_still_a_real_error():
 def test_a_number_that_was_genuinely_dropped_is_still_caught():
     d = verify.word_diff("twenty senators voted", "senators voted")
     assert "twenty" in d["hard_dropped"], d
+
+
+# --- clock times, which Whisper writes with a full stop -------------------
+# Measured on the GPU box: "7:45" came back as "7.45", read as a decimal, and
+# scored three dropped words and seven inserted ones on a clip where the model
+# had said "seven forty-five" perfectly.
+
+def test_a_clock_time_written_with_a_dot_is_not_a_drop():
+    d = verify.word_diff(
+        "The train leaves at seven forty-five and arrives at ten twenty",
+        "the train leaves at 7.45 and arrives at 10.20")
+    assert verify.clean(d), d
+    assert not verify.worth_regenerating(d)
+
+
+def test_a_real_decimal_is_never_read_as_a_clock_time():
+    """The charitable reading is only accepted when it improves the match."""
+    for sent, heard in [
+        ("his sons owe four point two five million", "his sons owe 4.25 million"),
+        ("pi is three point one four", "pi is 3.14"),
+    ]:
+        d = verify.word_diff(sent, heard)
+        assert verify.clean(d), (sent, heard, d)
+
+
+def test_the_clock_reading_cannot_hide_a_genuine_error():
+    d = verify.word_diff("the meeting at seven forty-five was cancelled",
+                         "the meeting at 7.45 was")
+    assert "cancelled" in d["hard_dropped"], d
+
+
+# --- a currency symbol the transcriber inferred ---------------------------
+# Measured on the GPU box, and confirmed independently: given "$4.2 million"
+# earlier in the sentence, BOTH Whisper and AssemblyAI wrote the following
+# bare "3 million" as "$3 million". That expands to a "dollars" the script
+# never contained, and it cost a full regeneration.
+
+def test_a_currency_symbol_the_transcriber_added_is_not_an_insertion():
+    d = verify.word_diff(
+        "Revenue fell from four point two million dollars in the first "
+        "quarter to just under three million in the second",
+        "Revenue fell from $4.2 million in the first quarter to just under "
+        "$3 million in the second")
+    assert verify.clean(d), d
+    assert not verify.worth_regenerating(d)
+
+
+def test_a_currency_word_the_model_really_dropped_is_still_caught():
+    d = verify.word_diff("he owes four million dollars", "he owes 4 million")
+    assert "dollars" in d["hard_dropped"], d
+    assert verify.worth_regenerating(d)
+
+
+def test_one_dropped_currency_word_out_of_two_is_still_caught():
+    """The spurious mark may be removed; a real omission may not be hidden."""
+    d = verify.word_diff(
+        "it cost five hundred dollars and two hundred dollars",
+        "it cost $500 and 200")
+    assert "dollars" in d["hard_dropped"], d
+
+
+def test_matching_currency_needs_no_special_reading():
+    d = verify.word_diff("it cost five hundred dollars", "it cost $500")
+    assert verify.clean(d), d

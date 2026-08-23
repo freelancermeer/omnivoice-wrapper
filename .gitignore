@@ -63,3 +63,8 @@ logs/
 # manifest.json points into outputs/, which is ignored above.
 manifest.json
 audit.json
+sample_manifest.json
+sample_audit.json
+# tools/verify_external.py output — contains transcripts, not secrets, but it
+# is a run artifact and is regenerated every time.
+external_check.json
