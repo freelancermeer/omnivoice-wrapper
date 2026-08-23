@@ -71,3 +71,10 @@ external_check.json
 
 # Timestamped copies made before deleting voices. Local safety net, not code.
 voices_backup_*/
+
+# Batch artifacts from the verifier-cost measurements.
+von.json
+voff.json
+fw.json
+fw_audit.json
+before_metrics.json

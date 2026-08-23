@@ -37,6 +37,10 @@ REM  karein; 12 se upar barhane ka koi faida nahi.
 REM set OMNIVOICE_ASR_BATCH=12
 REM  Whisper ko GPU se hata kar CPU pe (VRAM bachta hai, verification slow):
 REM set OMNIVOICE_ASR_DEVICE=cpu
+REM  Verifier ka transcriber CTranslate2 pe (pip install faster-whisper).
+REM  Speed barabar rehti hai, magar 1.6 GB VRAM bach jati hai kyunke
+REM  OmniVoice ka apna Whisper load hi nahi hota.
+REM set OMNIVOICE_ASR_BACKEND=faster
 
 echo Starting OmniVoice Voiceover Studio...
 echo (pehli baar model load me ~10-20 sec lagte hain)

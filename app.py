@@ -56,6 +56,7 @@ import html as html_mod
 import io
 import json
 import logging
+import math
 import queue as queue_mod
 import socket
 import re
@@ -120,6 +121,20 @@ def _default_checkpoint() -> str:
 
 CHECKPOINT = os.environ.get("OMNIVOICE_MODEL") or _default_checkpoint()
 ASR_MODEL = os.environ.get("OMNIVOICE_ASR_MODEL", "openai/whisper-large-v3-turbo")
+
+# The verifier's transcriber can run on CTranslate2 instead of transformers.
+# Same Whisper weights, a runtime built for inference: measured over 113.7 s of
+# audio on this box, 6.71 s -> 3.06 s on large-v3-turbo. Pointing it at `base`
+# is faster again (1.72 s) and, on injected defects, caught every one that
+# large-v3-turbo caught. Off by default: it is a second dependency
+# (`pip install faster-whisper`) and the checker is the last thing that should
+# change without someone deciding to.
+ASR_FAST = os.environ.get("OMNIVOICE_ASR_BACKEND", "").strip().lower() in (
+    "faster", "faster-whisper", "ct2")
+FW_MODEL = os.environ.get("OMNIVOICE_ASR_FW_MODEL",
+                          "mobiuslabsgmbh/faster-whisper-large-v3-turbo")
+# Empty means auto-detect, which is what the transformers pipeline does.
+ASR_LANGUAGE = os.environ.get("OMNIVOICE_ASR_LANGUAGE", "").strip()
 
 # --- text front-end -------------------------------------------------------
 NORMALIZE_LEVEL = os.environ.get("OMNIVOICE_NORMALIZE_LEVEL", "").strip().lower()
@@ -543,7 +558,7 @@ def _load_model(attn, extras: Optional[Dict[str, Any]] = None):
     kw: Dict[str, Any] = dict(
         device_map=device_map,
         dtype=dtype,
-        load_asr=True,
+        load_asr=not ASR_FAST,
         asr_model_name=ASR_MODEL,
         attn_implementation=attn,
     )
@@ -712,6 +727,47 @@ def _too_long_for_whisper(path: str) -> bool:
         return False
 
 
+_FW_LOCK = threading.Lock()
+_FW = [None]
+
+
+def _fw_model():
+    """The CTranslate2 Whisper, built once.
+
+    Same weights as the transformers pipeline, a different runtime. Measured on
+    this box over 113.7 s of audio: transformers 6.71 s, faster-whisper 3.06 s
+    on large-v3-turbo, 1.72 s on base — and on injected defects (a dropped
+    clause, a dropped sentence, three dropped words) base caught 10/10 of each,
+    missing nothing large-v3-turbo caught, while calling all ten untouched
+    clips clean.
+    """
+    with _FW_LOCK:
+        if _FW[0] is None:
+            from faster_whisper import WhisperModel
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            _FW[0] = WhisperModel(
+                FW_MODEL, device=dev,
+                compute_type="float16" if dev == "cuda" else "int8")
+            log.info("faster-whisper ASR backend: %s on %s", FW_MODEL, dev)
+    return _FW[0]
+
+
+def _fw_transcribe(x: np.ndarray, sr: int) -> str:
+    """Read a waveform with the CTranslate2 backend.
+
+    It wants 16 kHz mono, and handles any length itself — so there is no
+    30 s window to work around and no separate long-form path.
+    """
+    xx = np.asarray(np.squeeze(x), dtype=np.float32)
+    if sr != 16000:
+        from scipy.signal import resample_poly
+        g = math.gcd(int(sr), 16000)
+        xx = resample_poly(xx, 16000 // g, int(sr) // g).astype(np.float32)
+    segs, _info = _fw_model().transcribe(
+        xx, language=(ASR_LANGUAGE or None), beam_size=1)
+    return " ".join(s.text for s in segs).strip()
+
+
 def _transcribe_path(path: str) -> str:
     """ASR on a file, whatever its length.
 
@@ -719,6 +775,11 @@ def _transcribe_path(path: str) -> str:
     and `POST /api/transcribe` (which is how tools/audit_batch.py re-measures a
     finished batch) land here.
     """
+    if ASR_FAST:
+        x, sr = sf.read(path, dtype="float32", always_2d=False)
+        if x.ndim > 1:
+            x = x.mean(axis=1)
+        return call_model(lambda: _fw_transcribe(x, sr), label="transcribe")
     if _too_long_for_whisper(path):
         x, sr = sf.read(path, dtype="float32", always_2d=False)
         if x.ndim > 1:
@@ -728,6 +789,8 @@ def _transcribe_path(path: str) -> str:
 
 
 def _transcribe_short(x: np.ndarray, sr: int) -> str:
+    if ASR_FAST:
+        return call_model(lambda: _fw_transcribe(x, sr), label="transcribe")
     fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="omnivoice_vfy_")
     os.close(fd)
     try:
@@ -749,6 +812,8 @@ def _transcribe_long(x: np.ndarray, sr: int) -> str:
     "could not be verified" on it. Ask the pipeline for long-form directly
     where we can; otherwise walk the audio in windows ourselves.
     """
+    if ASR_FAST:
+        return call_model(lambda: _fw_transcribe(x, sr), label="transcribe-long")
     pipe = getattr(model, "_asr_pipe", None)
     if pipe is not None:
         for kw in ({"chunk_length_s": ASR_WINDOW_SEC, "batch_size": ASR_BATCH},
@@ -795,6 +860,8 @@ def _transcribe_many(waves, sr: int):
 
     Same model, same weights, same transcripts; only the scheduling changes.
     """
+    if ASR_FAST:
+        return None                       # CT2 reads each clip fast on its own
     pipe = getattr(model, "_asr_pipe", None)
     if pipe is None or len(waves) < 2:
         return None

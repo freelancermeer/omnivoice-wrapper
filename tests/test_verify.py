@@ -279,3 +279,39 @@ def test_one_dropped_currency_word_out_of_two_is_still_caught():
 def test_matching_currency_needs_no_special_reading():
     d = verify.word_diff("it cost five hundred dollars", "it cost $500")
     assert verify.clean(d), d
+
+
+# --- a bare inflection is the transcriber, not the model ------------------
+# "memory" against "memories" scores 0.714 on raw similarity, just under the
+# 0.72 threshold, so it was buying a full re-generation that could not fix it.
+
+def test_a_plural_the_transcriber_heard_is_not_a_defect():
+    for sent, heard in [
+        ("memory eleven", "memories 11"),
+        ("the report says", "the reports says"),
+        ("she asked", "she asks"),
+    ]:
+        d = verify.word_diff(sent, heard)
+        assert verify.clean(d), (sent, heard, d)
+        assert not verify.worth_regenerating(d), (sent, heard)
+
+
+def test_inflection_matching_never_excuses_a_meaning_change():
+    """CRITICAL_WORDS is checked first, so numbers and negations are safe."""
+    for sent, heard in [
+        ("he owes ninety million", "he owes 90 billion"),
+        ("it is not official", "it is now official"),
+        ("the first attempt", "the third attempt"),
+        ("nothing was found", "something was found"),
+        ("one hundred dollars", "one hundred"),
+    ]:
+        d = verify.word_diff(sent, heard)
+        assert not verify.clean(d), (sent, heard, d)
+
+
+def test_stemming_needs_a_word_left_over():
+    """Short words must not be stemmed down to nothing and matched."""
+    assert verify._stem("is") == "is"
+    assert verify._stem("as") == "as"
+    assert verify._stem("memories") == "memory"
+    assert verify._stem("reports") == "report"

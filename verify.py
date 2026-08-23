@@ -51,6 +51,18 @@ CRITICAL_WORDS = {
 ASR_SIMILARITY = 0.72
 
 
+_INFLECTIONS = ("'s", "ies", "es", "s", "ed", "ing")
+
+
+def _stem(word: str) -> str:
+    """Strip one ordinary English inflection, if there is enough word left."""
+    for suf in _INFLECTIONS:
+        if word.endswith(suf) and len(word) - len(suf) >= 3:
+            base = word[: -len(suf)]
+            return base + "y" if suf == "ies" else base
+    return word
+
+
 def likely_asr_artifact(sent_word: str, heard_word: str,
                         threshold: float = None) -> bool:
     """Is this substitution the transcriber, or the model?
@@ -64,6 +76,14 @@ def likely_asr_artifact(sent_word: str, heard_word: str,
         return True
     if sent_word in CRITICAL_WORDS or heard_word in CRITICAL_WORDS:
         return False
+    # A bare inflection is the transcriber hearing a word boundary slightly
+    # differently, not the model saying something else — "memory" against
+    # "memories" scores 0.714 on raw similarity, just under the threshold, and
+    # was buying a full re-generation that could not fix it. Numbers, money and
+    # negations never reach here: CRITICAL_WORDS is checked first, so "million"
+    # against "millions" is still a real difference.
+    if _stem(sent_word) == _stem(heard_word):
+        return True
     thr = ASR_SIMILARITY if threshold is None else threshold
     return difflib.SequenceMatcher(None, sent_word, heard_word).ratio() >= thr
 

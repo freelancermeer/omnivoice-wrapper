@@ -681,3 +681,111 @@ first, because those clips are the only copies that exist.
 Names are plain again — no `_2` suffixes. Re-verified on the new library:
 35 acceptance checks pass, and the ten-clip batch audits **0 added, 0 dropped,
 10/10 clean**.
+
+
+---
+
+# Chasing the verifier's cost, and where it actually went
+
+"RTF is bad, make the verifier fast." The measurements below are the answer,
+including the two experiments that did **not** work — which are the useful part.
+
+## First, the number that was being misread
+
+A batch of ten mixed clips reports `RTF avg 0.347`. That average includes a
+1.6 s clip whose RTF is 1.03, because a clip that short pays the same fixed
+per-request cost as a 73 s one while producing almost no audio. Its wall time
+is 1.7 s. Judging the server on that average is judging it on arithmetic.
+
+Measured properly, same batch, verification the only variable:
+
+| | wall | RTF avg | RTF best |
+|---|---:|---:|---:|
+| verification **on** | 27 s | 0.325 | 0.174 |
+| verification **off** | 20 s | 0.232 | 0.125 |
+
+**Verification costs 7 s in 27, about 35 %** on a short-clip batch, and **12.6 %**
+on long-form (0.170 against 0.151). The remembered "0.15" is still there; it is
+the unverified number, and always was.
+
+## Where that 7 s is not
+
+**It is not the regenerations.** `/api/metrics` showed 7 regenerations in 61
+generations, which looks like 11 % pure waste. Reading the audit log, every
+regeneration-triggering warning from earlier in the day was a number the
+transcriber wrote in digits — `not spoken: sixth / extra: 6th`,
+`not spoken: ten / extra: 10`, `not spoken: two hundred three hundred /
+extra: 200 300`. Re-running all ten of those cases against the current code:
+**nine are already fixed** by today's notation work. Those log lines were
+history, not a live problem.
+
+The tenth was live and is now fixed too — see below. And the one regeneration
+in the latest batch turned out to be the system **working**: the final warning
+list for that clip was clean, meaning a chunk really did come out wrong, was
+regenerated, and the second attempt was right. That is not waste; that is the
+product. Removing it means shipping the defect.
+
+### A bare inflection was buying a re-generation
+
+`memory` against `memories` scores 0.714 on raw similarity — just under the
+0.72 artefact threshold — so it counted as a real substitution and bought a
+full re-generation that could not have fixed it. `likely_asr_artifact` now
+matches on a stripped inflection first.
+
+CRITICAL_WORDS is still checked before that, so nothing that changes meaning
+gets waved through. Verified explicitly: `ninety million` → `90 billion`,
+`not official` → `now official`, `nothing` → `something`, `first` → `third`,
+and a dropped `dollars` are all still caught.
+
+## Two experiments that did not pay
+
+### Overlapping verification with the next generation — rejected on reasoning
+
+The obvious idea for queue work: verify clip N while generating clip N+1, and
+the checking becomes free. It does not, and it is worth writing down why so it
+is not attempted again. **Both halves are GPU-bound on the same GPU.** The 7 s
+of verification is 7 s of real GPU work; overlapping it with generation does
+not reduce the total work, it only interleaves it. Pipelining pays when one
+side is waiting on something else — here nothing is. Not built.
+
+### A faster ASR runtime — built, measured, kept for a different reason
+
+`faster-whisper` (CTranslate2) on the same large-v3-turbo weights is genuinely
+faster in isolation: over 113.7 s of audio, **6.71 s → 3.06 s**, and the `base`
+model is faster again at 1.72 s. On injected defects — a dropped clause, a
+dropped sentence, three dropped words — `base` caught **10/10 of each**, missing
+nothing large-v3-turbo caught, and called all ten untouched clips clean.
+
+End to end, it changed almost nothing:
+
+| | batch of 10 | long-form 203 s | VRAM allocated |
+|---|---:|---:|---:|
+| transformers (default) | 27 s | RTF 0.170 | 3529 MB |
+| faster-whisper | 26 s | RTF 0.168 | **1953 MB** |
+
+The reason is the morning's work: batching the verifier's windows had already
+taken the ASR to ~40x realtime, so it stopped being the bottleneck. Swapping
+runtimes cannot recover time that is no longer being spent there.
+
+What it *does* buy is **1.6 GB of VRAM**, because OmniVoice's own Whisper is
+not loaded when nothing calls it. On an 8 GB card shared with a desktop that is
+worth having, so it stays — as `OMNIVOICE_ASR_BACKEND=faster`, off by default,
+since it needs `pip install faster-whisper` and the checker is the last thing
+that should change without someone deciding to. Quality was re-audited on it:
+**0 added, 0 dropped, 10/10 clean.**
+
+## So what is left
+
+Verification costs what it costs, because reading every clip back is the thing
+that stops a dropped word reaching a customer. The levers that remain are not
+in the verifier:
+
+| lever | worth | where |
+|---|---|---|
+| **close Parsec** | ~25 % of the GPU, continuously | deployment, not code |
+| **FlashInfer** | claimed 2.1x at batch size 1 | needs Linux; impossible on Windows |
+| verification off | 0.170 → 0.151 long-form | `OMNIVOICE_VERIFY=0` + `audit_batch.py` after |
+
+The third is a real option and an honest one — the batch audit catches the same
+defects, just after the run instead of during it. It is a decision about when
+you want to find out, not whether.
