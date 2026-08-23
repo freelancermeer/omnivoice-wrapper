@@ -191,6 +191,10 @@ show a worse RTF than a paragraph — that is arithmetic, not a fault.
 
 ## Testing
 
+Testing on a fresh machine? **[WINDOWS_SESSION.md](WINDOWS_SESSION.md)** is a
+paste-ready brief: run order, the three numbers to capture, and the escape
+hatch for every change.
+
 ```powershell
 venv\Scripts\python -m pytest tests -q          REM no GPU needed
 venv\Scripts\python tools\acceptance.py --voice narrator_a
