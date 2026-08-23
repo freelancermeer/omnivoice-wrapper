@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -73,6 +75,31 @@ def free_cuda() -> None:
 # ---------------------------------------------------------------------------
 # Measuring
 # ---------------------------------------------------------------------------
+def expandable_segments_state() -> Dict:
+    """Did PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True actually take?
+
+    It is the one setting the launcher names as the cure for "GPU at 5 % and
+    out of memory", and on Windows torch accepts the variable, warns once into
+    the log, and carries on with the ordinary allocator. Measured on
+    torch 2.8.0+cu128 / Windows 11: the warning is "expandable_segments not
+    supported on this platform".
+
+    An inert setting that looks set is worse than one that is plainly off, so
+    report it rather than leaving it to a UserWarning nobody reads.
+    """
+    conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    requested = "expandable_segments:true" in conf.lower().replace(" ", "")
+    # Windows (WDDM) has no support for it in any torch release so far.
+    supported = not sys.platform.startswith("win")
+    return {
+        "requested": requested,
+        "effective": bool(requested and supported),
+        "note": ("ignored on Windows — fragmentation is held down by "
+                 "concurrency=1 and explicit cache release instead"
+                 if requested and not supported else ""),
+    }
+
+
 def snapshot() -> Dict:
     """Both numbers, always. `reserved - allocated` is the fragmentation that
     makes a card OOM at 5 % utilisation."""

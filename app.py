@@ -419,16 +419,36 @@ print(f"Checkpoint: {CHECKPOINT}")
 #                                            restarts instead of re-encoding
 #   main   enable_flashinfer                 PR #239, "2-2.9x lossless
 #                                            speedup"; 2.1x at batch size 1
+def _pops_kwarg(fn, name: str) -> bool:
+    """Does `fn` reach into **kwargs and take `name` back out by name?"""
+    try:
+        src = inspect.getsource(fn)
+    except (OSError, TypeError):  # pragma: no cover - C funcs, frozen installs
+        return False
+    return bool(re.search(r"kwargs\.(?:pop|get)\(\s*['\"]%s['\"]" % re.escape(name),
+                          src))
+
+
 def _accepts(fn, name: str) -> bool:
     """Does this callable take `name` as a real, named parameter?
 
-    Deliberately does not count **kwargs: something that swallows anything
-    tells us nothing about whether it does anything.
+    A bare **kwargs on its own still tells us nothing — anything that swallows
+    everything says nothing about what it does. But a callable that pops the
+    name straight back out of **kwargs plainly does support it, and this is
+    exactly how OmniVoice.from_pretrained is written: every option it has
+    gained since 0.1.5 (asr_device among them) arrives that way. Checking only
+    the named parameters reports those options as missing, which silently
+    disables our own env-var levers for them.
     """
     try:
-        return name in inspect.signature(fn).parameters
+        params = inspect.signature(fn).parameters
     except (TypeError, ValueError):  # pragma: no cover - builtins/C funcs
         return False
+    if name in params:
+        return True
+    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return False
+    return _pops_kwarg(fn, name)
 
 
 def _omnivoice_version() -> str:
@@ -612,12 +632,36 @@ class _Cancelled(Exception):
     """Raised to abort generation when a job is cancelled."""
 
 
+# Whisper takes 30 s of mel features at a time. Past that, transformers demands
+# return_timestamps=True and raises otherwise — and OmniVoice's own
+# transcribe() passes no such argument, so it cannot read anything longer.
+ASR_WINDOW_SEC = 30.0
+
+
+def _too_long_for_whisper(path: str) -> bool:
+    try:
+        info = sf.info(path)
+        return info.frames > int(ASR_WINDOW_SEC * info.samplerate)
+    except Exception:  # noqa: BLE001 - unreadable header: let the ASR decide
+        return False
+
+
 def _transcribe_path(path: str) -> str:
+    """ASR on a file, whatever its length.
+
+    A generated voiceover clip is routinely minutes long, and both the verifier
+    and `POST /api/transcribe` (which is how tools/audit_batch.py re-measures a
+    finished batch) land here.
+    """
+    if _too_long_for_whisper(path):
+        x, sr = sf.read(path, dtype="float32", always_2d=False)
+        if x.ndim > 1:
+            x = x.mean(axis=1)
+        return _transcribe_long(x, sr)
     return call_model(lambda: model.transcribe(path), label="transcribe") or ""
 
 
-def _transcribe_audio(x: np.ndarray, sr: int) -> str:
-    """ASR on an in-memory waveform (used by the verifier)."""
+def _transcribe_short(x: np.ndarray, sr: int) -> str:
     fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="omnivoice_vfy_")
     os.close(fd)
     try:
@@ -628,6 +672,46 @@ def _transcribe_audio(x: np.ndarray, sr: int) -> str:
             os.remove(tmp)
         except Exception:  # noqa: BLE001
             pass
+
+
+def _transcribe_long(x: np.ndarray, sr: int) -> str:
+    """ASR for audio past Whisper's 30 s input window.
+
+    This is the whole long-form case: a two-minute clip is exactly what the
+    verifier exists for, and without this it could not be read at all — the
+    transcription raised, verification was skipped, and the clip shipped with
+    "could not be verified" on it. Ask the pipeline for long-form directly
+    where we can; otherwise walk the audio in windows ourselves.
+    """
+    pipe = getattr(model, "_asr_pipe", None)
+    if pipe is not None:
+        try:
+            out = call_model(
+                lambda: pipe({"array": np.asarray(np.squeeze(x), dtype=np.float32),
+                              "sampling_rate": sr}, return_timestamps=True),
+                label="transcribe-long")
+            text = (out or {}).get("text", "")
+            if text.strip():
+                return text.strip()
+            log.warning("long-form ASR returned nothing; falling back to windows")
+        except Exception as e:  # noqa: BLE001
+            log.warning("long-form ASR failed (%s); falling back to windows", e)
+
+    step = int(ASR_WINDOW_SEC * sr)
+    said = []
+    for start in range(0, len(x), step):
+        piece = x[start:start + step]
+        if len(piece) < int(0.2 * sr):  # a sliver of tail carries no words
+            continue
+        said.append(_transcribe_short(piece, sr))
+    return " ".join(p for p in said if p).strip()
+
+
+def _transcribe_audio(x: np.ndarray, sr: int) -> str:
+    """ASR on an in-memory waveform (used by the verifier)."""
+    if len(np.squeeze(x)) > int(ASR_WINDOW_SEC * sr):
+        return _transcribe_long(x, sr)
+    return _transcribe_short(x, sr)
 
 
 def _gen_core(*args, **kwargs):
@@ -2700,6 +2784,7 @@ def _build_api():
             "queue": {"queued": q, "processing": p},
             "voices": list_voice_names(),
             "vram": gpu_guard.snapshot(),
+            "expandable_segments": gpu_guard.expandable_segments_state(),
             "readiness": READY.as_dict(),
             "watermark": {"enabled": WATERMARK, **watermark.status()},
             "omnivoice_version": OMNIVOICE_VERSION,
@@ -2816,7 +2901,7 @@ def _build_api():
 
     @api.post("/api/tts")
     async def tts(request: Request,
-                  text: str = Form(...), voice: UploadFile = File(None),
+                  text: Optional[str] = Form(None), voice: UploadFile = File(None),
                   voice_id: str = Form(None), ref_text: str = Form(None),
                   language: str = Form("Auto"), format: str = Form("mp3"),
                   steps: int = Form(16), speed: float = Form(1.0),
@@ -2875,7 +2960,7 @@ def _build_api():
 
     @api.post("/api/v2/tts")
     async def tts_v2(request: Request,
-                     text: str = Form(...), voice: UploadFile = File(None),
+                     text: Optional[str] = Form(None), voice: UploadFile = File(None),
                      voice_id: str = Form(None), ref_text: str = Form(None),
                      language: str = Form("Auto"), format: str = Form("mp3"),
                      steps: int = Form(16), speed: float = Form(1.0),
@@ -2925,7 +3010,7 @@ def _build_api():
 
     @api.post("/api/tts/async")
     async def tts_async(request: Request,
-                        text: str = Form(...), voice: UploadFile = File(None),
+                        text: Optional[str] = Form(None), voice: UploadFile = File(None),
                         voice_id: str = Form(None), ref_text: str = Form(None),
                         language: str = Form("Auto"), steps: int = Form(16),
                         speed: float = Form(1.0), project: str = Form("tts"),
@@ -3144,6 +3229,9 @@ if __name__ == "__main__":
                   f"loudness={'on' if NORMALIZE_OUTPUT else 'off'} "
                   f"({OUT_TARGET_LUFS:.0f} LUFS) · concurrency={MAX_CONCURRENCY}"
                   + (f" · tenants={len(TENANT_KEYS)}" if MULTI_TENANT else ""))
+            _seg = gpu_guard.expandable_segments_state()
+            if _seg["note"]:
+                print(f"  note: expandable_segments {_seg['note']}")
             print("=" * 60)
             app.launch(
                 server_name=server_name,

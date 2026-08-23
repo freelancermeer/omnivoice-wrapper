@@ -65,6 +65,7 @@ def main():
     total_added = total_dropped = 0
     clips_with_bleed = 0
     rows, tail_words, dropped_words = [], Counter(), Counter()
+    misheard_pairs = Counter()
     sent_total = spoken_total = 0
 
     for i, item in enumerate(items, 1):
@@ -82,7 +83,16 @@ def main():
             continue
         body = r.json()
         d = body.get("diff") or verify.word_diff(text, body["text"])
-        n_add, n_drop = len(d["hard_inserted"]), len(d["hard_dropped"])
+        # A word the transcriber spelled its own way ("Bessent" -> "besant",
+        # "authorisation" -> "authorization") is not a word the model failed to
+        # say. Both land in hard_dropped, so separate them here — otherwise the
+        # headline number answers a different question than the one asked.
+        misheard = [pair for pair in d.get("misheard", [])]
+        misheard_pairs.update(tuple(p) for p in misheard)
+        said_own_way = {s for s, _h in misheard} | {h for _s, h in misheard}
+        real_dropped = [w for w in d["hard_dropped"] if w not in said_own_way]
+        real_added = [w for w in d["hard_inserted"] if w not in said_own_way]
+        n_add, n_drop = len(real_added), len(real_dropped)
         total_added += n_add
         total_dropped += n_drop
         sent_total += d["sent_words"]
@@ -90,11 +100,12 @@ def main():
         if d["tail_inserted"]:
             clips_with_bleed += 1
             tail_words.update(d["tail_inserted"])
-        dropped_words.update(d["hard_dropped"])
+        dropped_words.update(real_dropped)
         rows.append({"file": path, "added": n_add, "dropped": n_drop,
                      "word_accuracy": d["word_accuracy"],
                      "tail_inserted": d["tail_inserted"],
-                     "hard_dropped": d["hard_dropped"],
+                     "hard_dropped": real_dropped,
+                     "misheard": misheard,
                      "heard": body["text"]})
         flag = "" if verify.passed(d) else "   <-- " + verify.describe(d)
         print(f"[{i}/{len(items)}] {os.path.basename(path):<34} "
@@ -115,6 +126,11 @@ def main():
         print("\nmost common dropped words:")
         for w, c in dropped_words.most_common(8):
             print(f"   {w:<20} x{c}")
+    if misheard_pairs:
+        print(f"\nspelt differently by the transcriber — not a model error "
+              f"({sum(misheard_pairs.values())} total):")
+        for (sent, heard), c in misheard_pairs.most_common(8):
+            print(f"   {sent:<18} heard as {heard:<18} x{c}")
     clean = sum(1 for r_ in rows if not r_["added"] and not r_["dropped"])
     print(f"\nclean clips: {clean}/{n}")
     print("=" * 64)

@@ -444,6 +444,9 @@ _CURRENCY_RE = re.compile(
 _PERCENT_RE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*%")
 _TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
 _ORDINAL_RE = re.compile(r"\b(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
+# The suffix on its own, so a bare number expansion can spot an ordinal by
+# looking just past the digits it is about to replace.
+_ORDINAL_SUFFIX_RE = re.compile(r"(st|nd|rd|th)\b", re.IGNORECASE)
 _MONTHS = ("January|February|March|April|May|June|July|August|September|"
            "October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec")
 _MONTH_DAY_RE = re.compile(
@@ -544,6 +547,13 @@ def expand_numbers(text: str, code: str, notes: List[str],
         tok = m.group(0)
         digits = re.sub(r"\D", "", tok)
         if not digits:
+            return tok
+        # "1st" is one word, not a digit with letters stuck to it. Expanding
+        # the digit on its own leaves "onest" / "twond" — and only -th
+        # ordinals survive it by luck. expand_ordinals handles these properly,
+        # but it only runs at level="full", so guard here too: level="basic"
+        # is a documented escape hatch and must not mispronounce dates.
+        if _ORDINAL_SUFFIX_RE.match(text, m.end()):
             return tok
         try:
             if len(digits) >= digit_run:

@@ -322,3 +322,29 @@ def test_space_before_punctuation_is_opt_in():
         assert any("space-before-punctuation" in n for n in notes)
     finally:
         textnorm.SPACE_BEFORE_PUNCT = False
+
+
+# --- ordinals at level="basic" --------------------------------------------
+# expand_ordinals only runs at level="full", but expand_numbers runs at every
+# level -- so "1st" had its digit replaced on its own and came out "onest".
+# level="basic" is a documented escape hatch (OMNIVOICE_NORMALIZE_LEVEL), and
+# it is the one people reach for when a number is read wrong.
+
+def test_basic_level_does_not_turn_ordinals_into_onest():
+    for raw in ("on the 1st of March", "the 2nd time", "the 3rd quarter",
+                "January 6th"):
+        out, _ = textnorm.normalize_text(raw, "English", level="basic")
+        for broken in ("onest", "twond", "threerd", "sixthth"):
+            assert broken not in out.lower(), (raw, out)
+
+
+def test_basic_level_still_expands_plain_numbers():
+    out, _ = textnorm.normalize_text("it ran to 90 pages", "English",
+                                     level="basic")
+    assert "ninety" in out, out
+
+
+def test_full_level_expands_ordinals_properly():
+    out, _ = textnorm.normalize_text("on the 1st of March", "English",
+                                     level="full")
+    assert "first" in out, out

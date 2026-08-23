@@ -324,11 +324,18 @@ sounds like the customer. That needs a speaker-embedding model, and the
 threshold has to be **measured on your own fixture voices**, not assumed —
 about 50 clips per voice to see the distribution, then set the gate.
 
-### The verifier's own cost is unmeasured on real hardware
+### The verifier's own cost — **now measured: ~35 %**
 
-One extra Whisper pass per chunk, under the same lock as generation. I estimate
-15–20 % on RTF; that number is a guess until it runs. `/api/metrics` →
-`verify_skipped` tells you if the budget is too tight.
+One extra Whisper pass per chunk, under the same lock as generation. The
+estimate here was 15–20 %. Measured on the 3060 Ti it is **32–37 %** on
+realistic clip lengths: RTF **0.203** with verification against **0.151**
+without ([GPU_RUN.md](GPU_RUN.md)).
+
+Two things that estimate could not have anticipated. The check was **not
+running at all on clips over 30 seconds** — Whisper's input window — so it
+looked cheap for the exact long-form case it matters most in. And the verifier
+was failing every clip containing a number, buying regenerations that fixed
+nothing. Both are fixed; the 35 % is the cost with it genuinely working.
 
 ---
 
@@ -340,7 +347,7 @@ clip that does not match its script is detected and reported rather than
 shipped. Loudness is deterministic. A dead GPU says it is dead. A wrong
 `voice_id` is a 404.
 
-**It is not verified.** 68 unit tests pass on the pure-Python half — the text
+**It is now verified on hardware — see [GPU_RUN.md](GPU_RUN.md).** 104 unit tests pass on the pure-Python half — the text
 front-end, the audio repair, the verifier. The GPU half has never executed. Every
 claim about VRAM, RTF, verification cost and watermarking is reasoning, not
 measurement, until `tools/acceptance.py` and `tools/audit_batch.py` run on

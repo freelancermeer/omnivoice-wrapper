@@ -58,3 +58,8 @@ logs/
 
 # Cached built voices (rebuildable, machine-specific)
 *.omniprompt
+
+# Batch-audit artifacts (regenerate with tools/make_batch.py + audit_batch.py).
+# manifest.json points into outputs/, which is ignored above.
+manifest.json
+audit.json

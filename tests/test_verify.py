@@ -163,3 +163,55 @@ def test_clean_clip_needs_nothing():
                          "the judge ordered a seizure")
     assert verify.clean(d) and not verify.worth_regenerating(d)
     assert verify.pronunciation_note(d) is None
+
+
+# --- numbers written as digits by the transcriber -------------------------
+# Measured on the GPU box: a 240-word clip warned "not spoken: ninety twenty;
+# extra: 90 20" and paid for a regeneration, because the script said "ninety
+# pages" and Whisper wrote "90 pages". Same number, different notation.
+
+def test_digits_heard_for_number_words_are_not_a_drop():
+    d = verify.word_diff("By noon the transcript ran to ninety pages",
+                         "by noon the transcript ran to 90 pages")
+    assert verify.clean(d), d
+    assert not verify.worth_regenerating(d)
+
+
+def test_multi_word_numbers_survive_the_notation_change():
+    d = verify.word_diff("A property worth one hundred fifty million dollars",
+                         "a property worth 150 million dollars")
+    assert verify.clean(d), d
+
+
+def test_every_notation_whisper_uses_for_a_number():
+    """Measured on the GPU box: each of these cost a warning and a wasted
+    regeneration, because the transcriber spells numbers its own way."""
+    for sent, heard in [
+        ("worth five hundred million dollars", "worth $500 million"),
+        ("from eleven thousand square feet", "from 11,000 square feet"),
+        ("by two hundred to three hundred percent", "by 200 to 300%"),
+        ("owe four point seven million dollars", "owe $4.7 million"),
+        ("the January sixth speech", "the January 6th speech"),
+        ("on the first of March", "on the 1st of March"),
+    ]:
+        d = verify.word_diff(sent, heard)
+        assert verify.clean(d), (sent, heard, d)
+
+
+def test_years_use_the_same_reading_as_the_script():
+    """2026 is "twenty twenty-six" here, not "two thousand twenty-six"."""
+    d = verify.word_diff("It happened in twenty twenty-six",
+                         "it happened in 2026")
+    assert verify.clean(d), d
+
+
+def test_a_different_number_is_still_a_real_error():
+    """The notation fix must not become a licence to mishear the value."""
+    d = verify.word_diff("he owes ninety million", "he owes 90 billion")
+    assert verify.worth_regenerating(d), d
+    assert "billion" in d["hard_inserted"]
+
+
+def test_a_number_that_was_genuinely_dropped_is_still_caught():
+    d = verify.word_diff("twenty senators voted", "senators voted")
+    assert "twenty" in d["hard_dropped"], d

@@ -139,7 +139,7 @@ Each row below is a measured finding and where it is handled.
 | **218 words spoken that were never sent.** One voice contributed 185 (`forcing` ×163). Its reference was hard-cut at exactly 10.0 s — mid-word — and the model kept finishing that word at the end of 86–90% of its clips. | References never end mid-word ([`audio_fx.smart_trim_reference`](audio_fx.py)), whether **we** cut them there (cut at the last natural pause instead, preferring a shorter clip over a mid-word one) or **the customer** stopped recording mid-word (cut back to their last finished phrase). Then faded, given 0.3 s of trailing silence, and re-transcribed so text and audio always agree. What cannot be repaired is explained at upload. Anything that still leaks is caught by the verifier and trimmed. |
 | **12 words silently dropped**, mostly one arm of a repeated structure ("He called it perjury / fraud / **contempt**" lost the middle clause), with nothing reporting it. | Every chunk is transcribed back and **sequence-aligned** against the script ([`verify.word_diff`](verify.py)). A drop triggers a regeneration; what cannot be fixed is reported in `X-OmniVoice-Warning` and on the job card. |
 | **Loudness tracked the reference**: −0.2 dB (edge of clipping) to −12.6 dB in one video. | ITU-R BS.1770 loudness normalization to **−20 LUFS** with a **−1 dBTP** ceiling, on both the stored reference and every output. |
-| **CUDA OOM that never recovered**, while `/api/health` said `"ok"` and GPU utilisation read 5 %. | `inference_mode`, results moved to CPU immediately, explicit `del` → `gc.collect()` → `empty_cache()`, `expandable_segments:True`, bounded concurrency, OOM retry and optional model reload ([`gpu_guard.py`](gpu_guard.py)). |
+| **CUDA OOM that never recovered**, while `/api/health` said `"ok"` and GPU utilisation read 5 %. | `inference_mode`, results moved to CPU immediately, explicit `del` → `gc.collect()` → `empty_cache()`, `expandable_segments:True` (**a no-op on Windows** — torch ignores it; see [GPU_RUN.md](GPU_RUN.md)), bounded concurrency, OOM retry and optional model reload ([`gpu_guard.py`](gpu_guard.py)). Measured over 73 generations: 0 OOM, 0 reloads, +0 MB allocated and +0 MB reserved across a 25-clip soak. |
 | **Health lied.** | `/api/ready` is backed by a **cached self-test that actually generates words**, and returns `503` when it fails. `/api/live` is the pure liveness probe. `/api/health` reports allocated **and** reserved VRAM, so fragmentation is visible. |
 | **Four concurrent callers killed the server.** | A semaphore (default 1 on 8 GB). Extra callers queue, then get `429` with `Retry-After`. |
 | **Stitched long-form output has an audible seam** — measured elsewhere at ~28 dB energy jumps and 67–69 Hz F0 jumps at chunk boundaries, and XTTS's per-chunk normalization makes volume jump between sentences. | `audio_fx.join_chunks`: even edges, a fixed inter-sentence gap, 15 ms edge fades, and level matching to the clip's **own median** (never to a fixed per-chunk target). |
@@ -201,7 +201,7 @@ venv\Scripts\python tools\acceptance.py --voice narrator_a
 venv\Scripts\python tools\audit_batch.py manifest.json
 ```
 
-- **`tests/`** — 58 unit tests for the text front-end, the audio repair and the
+- **`tests/`** — 104 unit tests for the text front-end, the audio repair and the
   verifier. Pure Python: they run on a laptop with no CUDA and no weights, which
   is where all three were developed.
 - **`tools/acceptance.py`** — run against a live server. Checks the frozen API
@@ -264,7 +264,7 @@ venv\Scripts\python tools\audit_batch.py manifest.json
 | `OMNIVOICE_AUTO_RELOAD` | `1` | reload the model after a fatal CUDA error |
 | `OMNIVOICE_SELFTEST` | `1` | background self-test that backs `/api/ready` |
 | `OMNIVOICE_SELFTEST_EVERY` | `120` | seconds between self-tests |
-| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | set automatically |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | set automatically; **ignored by torch on Windows** — `GET /api/health` reports whether it took effect |
 
 ### Provenance & compliance
 See **[RESEARCH.md](RESEARCH.md) §5** — EU AI Act Article 50 has been enforceable

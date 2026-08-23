@@ -69,10 +69,44 @@ def likely_asr_artifact(sent_word: str, heard_word: str,
 
 _CLEAN_RE = re.compile(r"[^a-z0-9' ]")
 
+try:  # the same converter the script side already went through
+    import textnorm as _textnorm
+except Exception:  # pragma: no cover - verify.py still works without it
+    _textnorm = None
+
+
+def _as_spoken(text: str) -> str:
+    """Numbers, money, percentages and ordinals in the shape they were said.
+
+    The script that reaches the model has already been through textnorm, so it
+    reads "ninety pages" and "one hundred fifty million dollars". Whisper
+    writes the same speech back in its own notation — "90 pages", "$150
+    million", "11,000", "4.7", "6th". Those are the transcriber's spelling
+    choices, not words the model dropped.
+
+    Left alone they are scored as drops *and* insertions, because the number
+    words sit in CRITICAL_WORDS — rightly, since "million" heard as "billion"
+    must never be waved through. Measured on the GPU box, that cost a warning
+    and a wasted regeneration on nearly every clip containing a figure.
+
+    So both sides go through the one normalizer the script already used, which
+    keeps a single set of rules for both — years included: 2026 reads "twenty
+    twenty-six", not "two thousand twenty-six". It is a no-op on text that has
+    already been normalized.
+    """
+    if _textnorm is None or not text:
+        return text
+    try:
+        out, _notes = _textnorm.normalize_text(text, None, level="full")
+        return out or text
+    except Exception:  # noqa: BLE001 - a checker must never break a render
+        return text
+
 
 def words(text: str) -> List[str]:
     """Put the script and the ASR output into one shape."""
-    t = (text or "").lower().replace("’", "'").replace("-", " ")
+    t = _as_spoken(text or "")
+    t = t.lower().replace("’", "'").replace("-", " ")
     t = _CLEAN_RE.sub(" ", t)
     return [w for w in (tok.strip("'") for tok in t.split()) if w]
 

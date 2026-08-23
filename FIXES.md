@@ -4,10 +4,16 @@ Written against four documents: `omnivoicebugs.md`, `omnivoicetextbrief.md`,
 `omnivoiceoombrief.md`, and `OMNIVOICE_HARNESS_CORRECTIONS.md`. Where the
 corrections file disagreed with the others, it won — that was its instruction.
 
-Nothing here has been run against a GPU. The pure-Python half (text handling,
-audio repair, the verifier) has **58 unit tests that pass**, and there is an
-end-to-end simulation below reproducing the original failure and its fix. The
-model-facing half compiles and is reviewed, but needs the Windows machine.
+**This has now run on a GPU — see [GPU_RUN.md](GPU_RUN.md) for what it
+measured.** The headline results: reference bleed gone (0 added, 0 dropped, 0 %
+trailing artefact across a 25-clip audit), RTF **0.203** verified / **0.151**
+unverified, and six further defects found and fixed on hardware — including a
+verifier that silently did not run on any clip over 30 seconds. Read that file
+before this one; where the two disagree, it wins, because it was measured.
+
+The pure-Python half (text handling, audio repair, the verifier) has **104 unit
+tests that pass**, and there is an end-to-end simulation below reproducing the
+original failure and its fix.
 
 ---
 
@@ -20,7 +26,7 @@ model-facing half compiles and is reviewed, but needs the Windows machine.
 | `verify.py` | transcribe-back word diff | ✅ 12 tests |
 | `gpu_guard.py` | OOM handling, VRAM snapshots, readiness | needs torch |
 | `lexicon.json` | pronunciation overrides you own and edit | — |
-| `tests/` | the 58 tests | ✅ |
+| `tests/` | the 104 tests | ✅ |
 | `tools/acceptance.py` | run against a live server before selling | GPU |
 | `tools/audit_batch.py` | re-run the audit that found the bugs | GPU |
 | `docs/reference_playbook.md` | hand this to customers | — |
@@ -65,7 +71,7 @@ that wasn't. That is why accuracy can never be the only gate.
 | 1 | 218 words added; reference bleed | `audio_fx.smart_trim_reference` handles **both** ways a reference ends mid-word — one we cause (cut at the last pause before the limit, and prefer a shorter clip over a mid-word one) and one the customer causes (they stopped recording mid-word, so cut back to their last finished phrase; refused only when under 3 s would be left, and then explained). It cuts at the last pause before the limit, strips silence, fades, appends 0.3 s. `POST /api/voices` already accepted `ref_text` — it now also **validates it against the audio** and returns the transcript actually used. A reference with no pause anywhere warns at upload. Anything that still leaks is caught by the verifier and trimmed. |
 | 2 | 12 words dropped, silently | `verify.word_diff` on every chunk; a drop triggers a regeneration; whatever survives is reported in `X-OmniVoice-Warning`, the v2 JSON, the job status and the UI card. |
 | 3 | Loudness tracked the reference | BS.1770-4 K-weighted loudness + 4× true peak. References normalized at registration, outputs at delivery: −20 LUFS, −1 dBTP. Measured level returned in `X-LUFS` / `X-True-Peak-dB`. |
-| 4 | CUDA OOM, never recovers | `inference_mode`, results to CPU immediately, named `del` → `gc.collect()` → `empty_cache()`, `expandable_segments:True` set before torch imports, concurrency semaphore, OOM retry, optional model reload with voice-prompt invalidation. |
+| 4 | CUDA OOM, never recovers | `inference_mode`, results to CPU immediately, named `del` → `gc.collect()` → `empty_cache()`, `expandable_segments:True` set before torch imports (**measured: torch ignores this on Windows** — see [GPU_RUN.md](GPU_RUN.md); concurrency=1 and the explicit cache release are what actually hold fragmentation down there), concurrency semaphore, OOM retry, optional model reload with voice-prompt invalidation. |
 | 5 | `/api/health` said "ok" while dead | `/api/live`, `/api/ready` (cached self-test), `/api/selftest`, and `/api/health` reporting allocated **and** reserved VRAM. `/api/ready` returns 503 + `Retry-After`. |
 | 6 | 133–203 wpm | Balanced chunking (no more 100-char chunk beside a 6-char one), wpm measured per clip, compared to the voice's own baseline. Metric, not a gate. |
 | 7 | 4 callers killed it; unknown params accepted; error content type | Semaphore + 429 + `Retry-After`; unknown params reported in a header and counted in `/api/metrics`; errors are JSON with proper status codes. |
@@ -229,7 +235,7 @@ is the author's claim, not a measurement on your hardware.
 | Watch | Where | Why |
 |---|---|---|
 | VRAM `fragmentation_mb` | `GET /api/health` | the only number that predicted the old OOM |
-| RTF | `X-RTF`, job cards | verification adds one Whisper pass per chunk, roughly 15–20 % |
+| RTF | `X-RTF`, job cards | verification adds one Whisper pass per chunk — **measured at ~35 %** (0.203 verified vs 0.151 not), not the 15–20 % estimated here |
 | `verify_skipped` | `GET /api/metrics` | above ~5 % means the budget is too tight |
 | `X-OmniVoice-Warning` | every response | the whole point; empty is what you want |
 | `regenerations` | `GET /api/metrics` | how often the model needed a second attempt |

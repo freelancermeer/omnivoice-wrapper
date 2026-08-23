@@ -1,103 +1,124 @@
-# Tomorrow's prompt — paste this into a fresh Claude Code session on Windows
+# The Windows GPU session — done, with the numbers
 
-Everything below the line is meant to be copied as-is. It is written to be
-self-contained, because the session on the Windows box will not have seen the
-work that produced this code.
+This file used to be a prompt to paste into a fresh session. That session has
+now happened (23–24 August 2026), so it carries the results instead. The full
+write-up is **[GPU_RUN.md](GPU_RUN.md)**; this is the short version.
 
-Keep this file; if a later round of changes happens, update the numbers in it
-rather than rewriting it.
+Keep updating the numbers here rather than rewriting the file.
 
 ---
 
-Ye OmniVoice TTS wrapper hai jo main sell kar raha hoon. Code Mac pe likha gaya
-tha aur **GPU pe kabhi chala hi nahi** — aaj pehli baar Windows pe test kar raha
-hoon. Machine: RTX 3060 Ti 8 GB, CUDA 12.8, Windows.
+## Ye tha sawal, ye hai jawab
 
-**Pehle `FIXES.md`, `RESEARCH.md` aur `README.md` padh lo** — poora context wahan
-hai. Short version: ek production batch (63 clips / 10,269 words) transcribe
-karke script se diff kiya gaya tha, usme mila:
+| Sawal | Jawab |
+|---|---|
+| **RTF kitna hai?** | **0.203** verification ke saath, **0.151** uske baghair. Purana 0.16 asal me *unverified* number tha — verification band karo to wo wapas aa jata hai. |
+| **Verification ka cost?** | **~35 %** (32–37 % realistic lengths pe). Docs me 15–20 % ka andaza tha — asli cost double hai. |
+| **Audit: added / dropped?** | **0 added, 0 dropped, 0 % trailing artefact**, 25/25 clean clips. Pehle 218 aur 12 the. |
 
-- **218 words jo bheje hi nahi gaye the** — reference audio exactly 10.000s pe
-  mid-word cut ho raha tha, aur wo aadha word har clip ke end me aa raha tha
-  ("forcing" ×163)
-- **12 words chup-chaap gir gaye**, kisi ne report nahi kiya
-- Ek hi video me loudness −0.2 dB se −12.6 dB tak
-- CUDA OOM jo kabhi recover nahi hota tha, jabki `/api/health` "ok" bolta tha
+Do lafz farq the — `Bessent` → "besant", `authorisation` → "authorization" —
+aur dono **transcriber ki spelling** hain, model ki ghalti nahi. Verifier ne
+dono ko pronunciation note kaha, regeneration par paisa nahi lagaya.
 
-Sab fix ho chuka hai (95 unit tests pass, bina GPU ke), plus upstream issue
-tracker padh ke chunking aur omnivoice version bhi update kiya. **Lekin GPU wala
-hissa kabhi execute nahi hua.**
+---
 
-## Aaj ye run karna hai, isi tarteeb se
+## Reference wala bug — sach me theek ho gaya
+
+Saboot disk pe hi mojood tha: 6 me se 5 references **theek 10.0000 s** ke thay —
+purane stopwatch cut ka nishan.
+
+| voice | pehle | ab | quality | LUFS |
+|---|---|---|---|---|
+| RVoiceover_1 | 10.000 s | 9.82 s | 1.00 | −20.0 |
+| RVoiceover_2 | 10.000 s | 9.18 s | 0.85 | −20.0 |
+| RVoiceover_3 | 10.000 s | **7.52 s** | 0.85 | −20.0 |
+
+`RVoiceover_3` ka `ref_text` pehle `...and forcing.` pe khatam hota tha. Ab
+`...his own handpicked judges...` pe khatam hota hai. **"forcing" jad se
+khatam**, aur audit confirm karta hai ke aage kuch leak nahi hua.
+
+---
+
+## GPU pe chhe naye bugs mile — sab fix
+
+Chaar sirf hardware pe hi mil sakte thay:
+
+1. **Verifier 30 second se lambi kisi bhi clip pe chal hi nahi raha tha.**
+   Sabse bura wala. Whisper ek waqt me 30 s leta hai; us se aage
+   `return_timestamps=True` chahiye warna exception. Matlab long-form kaam pe —
+   jo is product ka asli use case hai — check khamoshi se skip ho raha tha.
+2. **Har number wali clip fail ho rahi thi.** Script "ninety", Whisper "90" —
+   ek hi number, alag notation, magar drop + insert count ho raha tha.
+   49 generations me **22 verify failures, 25 regenerations**. Ab **0 aur 0**.
+3. **`1st` → "onest"** jab `OMNIVOICE_NORMALIZE_LEVEL=basic` ho — yani theek us
+   setting me jo aap number galat parhne par khud istemal karte.
+4. **`OMNIVOICE_ASR_DEVICE` chup-chaap dead tha** — feature detection `**kwargs`
+   ko nahi dekhti thi. Yehi bug `OMNIVOICE_FLASHINFER=1` ko bhi mar deta.
+5. **Khali text 422 deta tha, 400 nahi** — sahi check likha hua tha magar chal
+   hi nahi raha tha.
+6. **`expandable_segments:True` Windows pe kuch nahi karta.** torch use qubool
+   karta hai, ek warning likhta hai, aur ignore kar deta hai. Ab `/api/health`
+   aur banner sach batate hain.
+
+---
+
+## Stability
+
+`tools/acceptance.py` → **35 passed, 0 failed, 1 skipped**.
+`pytest tests -q` → **104 passed**.
+
+73 generations me: **0 OOM, 0 model reloads, 0 verify failures/skips**, soak ke
+baad **+0 MB allocated aur +0 MB reserved**, fragmentation 151 MB (gate 800).
+Chaar concurrent callers: `[200, 200, 200, 200]`, server zinda.
+
+**Seed deterministic nikla** — same seed = byte-identical audio. Iska matlab
+golden-file tests yahan sach me kaam karte hain.
+
+---
+
+## Ab faisla aapka hai
+
+Verification RTF **0.151 → 0.203** le jati hai. Badle me server aapko bata deta
+hai ke koi lafz gir gaya. Lever: `OMNIVOICE_VERIFY=0`, aur phir batch ke baad
+`tools\audit_batch.py` se ek hi pass me poora check.
+
+Mera mashwara: **on rakhein.** 35 % ki qeemat us se kam hai jo ek dropped word
+customer ki cut hui video me pakde jane par lagti hai — aur ab regenerations 0
+hain, to asli kharcha pehle se kam ho gaya hai.
+
+---
+
+## Jo abhi bhi nahi hua
+
+- **Watermarking** — `audioseal` install hi nahi. Public paisa lene se pehle
+  karna zaroori hai (EU AI Act Article 50, 2 Aug 2026 se enforceable).
+- **VRAM leak lambe run pe** — upstream #199 kehta hai ye dinon me zahir hota
+  hai; yahan sab se lamba run ek ghante se kam tha. Flat memory achhi khabar
+  hai, saboot nahi.
+- **FlashInfer** — nahi chalaya; base version pehle confirm karna tha. Bug #4
+  is ko waise bhi khamoshi se rok deta, ab raasta saaf hai.
+- **Speaker similarity** aur **do-speaker reference** — jaise thay waise hain.
+- **Asli 63-clip batch** — uski scripts repo me nahi hain, is liye
+  `tools/make_batch.py` ne 25 clips ka batch usi register me banaya.
+
+---
+
+## Ek operational baat
+
+Server ko `taskkill /PID <pid> /T /F` se band karein. Is session me plain
+terminate ne process ko port 8001 pakde chhod diya, aur ek "restarted" server
+asal me purana hi tha — jis se measurements ka ek round kharab hua. Agla run
+shuru karne se pehle `netstat -ano | findstr :8001` se confirm karein ke port
+khali hai.
+
+## Naye tools
 
 ```powershell
-git pull
-venv\Scripts\python -m pip install -r requirements.txt
-venv\Scripts\python -m pip install pytest requests
-venv\Scripts\python -m pytest tests -q
-```
-
-`95 passed` aana chahiye. Phir `run.bat`. Banner pe ye dekhna:
-
-```
-omnivoice 0.2.1 · features: asr_device, pad_duration, fade_duration
-verify=on · normalize=full · loudness=on (-20 LUFS) · concurrency=1
-```
-
-Agar `OUTDATED` likha aaye to pip wali line chali nahi — pehle wo theek karo.
-
-Phir apni teen voices dobara register karo (clips repair ho ke andar jaati hain,
-purani entries purane code se bani hain), aur reply me aane wale `warnings`
-zaroor padho — `RVoiceover_3` wahi hai jo "and" pe khatam hoti thi:
-
-```powershell
-curl -X POST http://127.0.0.1:8001/api/voices -F "name=RVoiceover_3" -F "voice=@RVoiceover_3.mp3"
-```
-
-Phir:
-
-```powershell
-venv\Scripts\python tools\acceptance.py --voice RVoiceover_3
+venv\Scripts\python tools\rtf_probe.py  --voice RVoiceover_3_2 --repeat 2
+venv\Scripts\python tools\make_batch.py --voice RVoiceover_3_2
 venv\Scripts\python tools\audit_batch.py manifest.json --out audit.json
 ```
 
-## Teen numbers chahiye mujhe — inhi pe sab decide hoga
-
-1. **RTF.** Pehle mujhe **0.16** milta tha 16 steps pe. Ye mera sabse ahem
-   number hai. UI ke queue header pe "avg RTF" dikhta hai, API pe `X-RTF`
-   header, aur `GET /api/metrics` pe `rtf_overall`.
-2. **Verification ka exact cost.** `tools/acceptance.py --quick` do baar chalao,
-   ek baar `OMNIVOICE_VERIFY=0` ke saath. `X-RTF` ka farq hi asli cost hai.
-3. **Audit ka added/dropped count.** Target **0 added, 0 dropped** — pehle 218
-   aur 12 the.
-
-## Agar kuch toota
-
-Har badi cheez ek env var se off hoti hai, full rollback ki zaroorat nahi:
-
-| Symptom | Lever |
-|---|---|
-| RTF expectation se zyada | `OMNIVOICE_VERIFY=0` (checking batch ke baad `audit_batch.py` se) |
-| Koi number galat pada gaya | `OMNIVOICE_NORMALIZE_LEVEL=basic` ya `off` |
-| Clips edit ke liye zyada loud/halke | `OMNIVOICE_OUT_LUFS=-16`, ya `OMNIVOICE_NORMALIZE_OUTPUT=0` |
-| Achhi reference reject ho rahi hai | `OMNIVOICE_STRICT_REF=0` |
-| Voice chhoti clips pe badalti hai | `OMNIVOICE_MAX_CHARS` badhao (abhi 200) |
-| Aakhri lafz kat raha hai | `OMNIVOICE_PAD_DURATION` / `OMNIVOICE_FADE_DURATION` (0.2.0+) |
-
-Purana kaam karta version: `git checkout 7d2a387`.
-
-## Kaam karne ka tareeqa
-
-- Jo bhi tootey, **pehle wajah dhoondo, phir fix** — check ko band karke
-  "pass" mat dikhana.
-- Har result me batao ke tumne **khud verify kiya** ya sirf reasoning hai.
-- Koi bhi fix karo to `pytest tests -q` dobara chalao, aur commit `main` pe
-  push kar do.
-- Agar RTF verification ki wajah se 0.16 se kaafi upar gaya, to mujhse poocho
-  ke verification band karein ya batch ke baad chalayein — ye faisla mera hai.
-
-## Agar RTF theek raha aur waqt bacha
-
-`RESEARCH.md` §8 me FlashInfer wala experiment hai — upstream PR #239 kehta hai
-batch size 1 pe **2.1× lossless speedup**. Wo `omnivoice` git main pe le jata
-hai, to base version confirm hone ke baad hi karna.
+`rtf_probe.py` RTF ko clip length ke against naapta hai — ek akela RTF number is
+server ke liye be-matlab hai, kyunke chhoti clip pe fixed cost hi ghalib rehti
+hai.
