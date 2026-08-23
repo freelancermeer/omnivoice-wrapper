@@ -167,7 +167,9 @@ time actually goes, and what each lever costs:
 | **`OMNIVOICE_VERIFY_MODE=fast`** (default) | one ASR pass over the finished clip instead of one per chunk — a five-chunk job drops from 5 extra passes to **1** | drilling into chunks only happens when something is actually wrong |
 | `OMNIVOICE_VERIFY=0` | removes checking entirely | you go back to shipping bad clips silently — the thing this exists to prevent |
 | *(automatic)* | a substitution the transcriber probably misheard no longer triggers a re-generation | none — it is reported as a pronunciation note instead |
-| `OMNIVOICE_MAX_CHARS` | larger chunks = fewer seams and fewer per-call overheads | too large and long-text degeneration returns |
+| `OMNIVOICE_MAX_CHARS` | now `200`. Fewer, longer chunks mean fewer fixed per-call overheads **and** a steadier voice — upstream reports speaker switching on short generations | too large and long-text degeneration returns (upstream #144) |
+| `OMNIVOICE_NUM_STEP` | the one parameter that reliably trades quality for speed | below ~10 it shows |
+| *(not a lever)* | `guidance_scale` — upstream #163 reports it has no audible effect through the Python API | — |
 | `OMNIVOICE_BATCH` | >1 batches chunks per GPU call | usually *raises* RTF: padding to the longest chunk wastes compute. Only for long, uniform chunks |
 | `OMNIVOICE_PREWARM_VOICES=1` | no embedding rebuild on the first request per voice after a restart | none |
 
@@ -212,7 +214,9 @@ venv\Scripts\python tools\audit_batch.py manifest.json
 | `OMNIVOICE_YEARS` | `1` | read 1100–2099 as years ("twenty twenty-four") |
 | `OMNIVOICE_NUM_STYLE` | `us` | `us` = "one hundred fifty" · `uk` = "one hundred and fifty" |
 | `OMNIVOICE_CHUNK` | `1` | sentence chunking for long text |
-| `OMNIVOICE_MAX_CHARS` | `100` | target characters per chunk |
+| `OMNIVOICE_MAX_CHARS` | `200` | target characters per chunk (100–250 is the recommended band) |
+| `OMNIVOICE_MIN_CHUNK_CHARS` | `MAX_CHARS/3` | never emit a chunk shorter than this — short generations are where upstream reports the voice switching speaker |
+| `OMNIVOICE_SPACE_BEFORE_PUNCT` | `0` | upstream #116 workaround for swallowed final consonants; A/B it before trusting it |
 
 ### Reference audio
 | Var | Default | Purpose |

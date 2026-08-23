@@ -242,6 +242,20 @@ def unicode_cleanup(text: str, notes: Optional[List[str]] = None) -> str:
     return "".join(kept)
 
 
+# Upstream #116: a user reports that putting a space before commas and full
+# stops ("Hola , esto es una prueba .") often stops the model swallowing the
+# final phoneme of the preceding word — the same shape as the dropped words in
+# our own batch. It is a community workaround, never confirmed by a maintainer,
+# and it changes every string, so it is off by default and meant to be A/B'd
+# with tools/audit_batch.py.
+SPACE_BEFORE_PUNCT = False
+_PUNCT_SPACE_RE = re.compile(r"(?<=\w)([,.])(\s|$)")
+
+
+def space_before_punctuation(text: str) -> str:
+    return _PUNCT_SPACE_RE.sub(r" \1\2", text)
+
+
 def collapse(text: str) -> str:
     """Tidy the spacing/punctuation left behind by the expansions above."""
     t = re.sub(r"[ \t]+", " ", text)
@@ -600,6 +614,9 @@ def normalize_text(text: str,
                 t = expand_ordinals(t, code, notes)
         t = expand_numbers(t, code, notes, years=years)
         out = collapse(t)
+        if SPACE_BEFORE_PUNCT:
+            out = space_before_punctuation(out)
+            notes.append("space-before-punctuation workaround applied")
     except Exception as e:  # noqa: BLE001 - normalization must never break TTS
         log.warning("normalization failed (%s); using the original text", e)
         return text, notes
@@ -698,14 +715,64 @@ def _split_long(sentence: str, limit: int) -> List[str]:
     return [p for p in final if p.strip()]
 
 
-def chunk_text(text: str, max_chars: int = 100,
+def merge_short_chunks(chunks: List[str], min_chars: int,
+                       ceiling: int) -> List[str]:
+    """Fold every undersized chunk into a neighbour, not just the last one.
+
+    A short chunk is the worst thing to hand this model. Upstream #229/#206
+    report the cloned voice **changing speaker, sometimes gender**, on short
+    sentences generated separately — "There's fruit.", "Me." — while "longer
+    sentences appear more stable", and raising the step count from 32 to 64 did
+    not help. A three-word chunk is also where the measured batch found its
+    fastest, most rushed delivery (190-203 wpm against a 161 mean).
+
+    Merging is free in both directions: fewer, longer chunks mean fewer
+    per-call overheads as well as a steadier voice.
+    """
+    if len(chunks) < 2:
+        return chunks
+    out = list(chunks)
+    changed = True
+    while changed and len(out) > 1:
+        changed = False
+        for i, piece in enumerate(out):
+            if len(piece) >= min_chars:
+                continue
+            prev_len = len(out[i - 1]) if i > 0 else None
+            next_len = len(out[i + 1]) if i + 1 < len(out) else None
+            # Merge into whichever neighbour has room, preferring the smaller.
+            options = []
+            if prev_len is not None and prev_len + 1 + len(piece) <= ceiling:
+                options.append((prev_len, i - 1))
+            if next_len is not None and next_len + 1 + len(piece) <= ceiling:
+                options.append((next_len, i + 1))
+            if not options:
+                continue
+            _size, target = min(options)
+            if target < i:
+                out[target] = out[target] + " " + piece
+            else:
+                out[target] = piece + " " + out[target]
+            out.pop(i)
+            changed = True
+            break
+    return out
+
+
+def chunk_text(text: str, max_chars: int = 200,
                min_chars: Optional[int] = None) -> List[str]:
     """Split into ~evenly sized chunks at sentence boundaries.
 
-    Even sizing matters: the production report measured 133-203 wpm across one
-    batch, and short inputs are the rushed ones. Greedy packing used to leave a
-    5-character last chunk next to a 100-character one; balanced packing keeps
-    every chunk in the same size band, and a tiny tail is merged back.
+    Two forces, and they pull the same way:
+
+    * **Too short is dangerous.** Upstream reports the cloned voice switching
+      speaker on short sentences, and short inputs are the rushed ones
+      (190-203 wpm against a 161 mean in the measured batch).
+    * **Too long degenerates.** Upstream #144 is crackling/non-speech on long
+      hesitation-heavy text, which is why chunking exists at all.
+
+    So: aim for evenly sized chunks inside the 100-250 character band the
+    long-form literature recommends, and never emit an undersized one.
     """
     text = (text or "").strip()
     if not text:
@@ -736,11 +803,8 @@ def chunk_text(text: str, max_chars: int = 100,
     if cur:
         chunks.append(cur)
 
-    min_chars = min_chars if min_chars is not None else max(20, max_chars // 4)
-    if (len(chunks) > 1 and len(chunks[-1]) < min_chars
-            and len(chunks[-2]) + len(chunks[-1]) + 1 <= int(max_chars * 1.6)):
-        tail = chunks.pop()
-        chunks[-1] = chunks[-1] + " " + tail
+    min_chars = min_chars if min_chars is not None else max(40, max_chars // 3)
+    chunks = merge_short_chunks(chunks, min_chars, int(max_chars * 1.6))
     return chunks or [text]
 
 

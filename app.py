@@ -128,10 +128,21 @@ LEXICON_PATH = os.environ.get("OMNIVOICE_LEXICON", os.path.join(_HERE, "lexicon.
 YEAR_STYLE = _env_flag("OMNIVOICE_YEARS")
 # "us" -> "one hundred fifty"; "uk" -> "one hundred and fifty".
 textnorm.NUM_STYLE = os.environ.get("OMNIVOICE_NUM_STYLE", "us").strip().lower()
+# Community workaround from upstream #116 for swallowed final phonemes. Off by
+# default; A/B it with tools/audit_batch.py before trusting it.
+textnorm.SPACE_BEFORE_PUNCT = _env_flag("OMNIVOICE_SPACE_BEFORE_PUNCT", "0")
 LEXICON = textnorm.load_lexicon(LEXICON_PATH)
 
 CHUNK = _env_flag("OMNIVOICE_CHUNK")
-MAX_CHARS = int(os.environ.get("OMNIVOICE_MAX_CHARS", "100"))
+# Target characters per chunk. 100 was too small in both directions: upstream
+# #229/#206 report the cloned voice switching speaker on short generations
+# ("longer sentences appear more stable"), and every extra chunk is another
+# fixed per-call overhead on the RTF. 200 sits inside the 100-250 band the
+# long-form literature recommends, while staying well clear of #144 (crackling
+# on very long inputs). Nothing shorter than MAX_CHARS/3 is ever emitted.
+MAX_CHARS = int(os.environ.get("OMNIVOICE_MAX_CHARS", "200"))
+MIN_CHUNK_CHARS = int(os.environ.get("OMNIVOICE_MIN_CHUNK_CHARS",
+                                     str(max(40, MAX_CHARS // 3))))
 GAP_SEC = float(os.environ.get("OMNIVOICE_CHUNK_GAP", "0.15"))
 
 # --- reference audio ------------------------------------------------------
@@ -230,7 +241,7 @@ def normalize_for_tts(text: str, language: Optional[str]) -> Tuple[str, List[str
 
 
 def chunk_text(text: str, max_chars: int = MAX_CHARS) -> List[str]:
-    return textnorm.chunk_text(text, max_chars)
+    return textnorm.chunk_text(text, max_chars, min_chars=MIN_CHUNK_CHARS)
 
 
 def concat_audio(parts, sr, gap_sec=GAP_SEC):
@@ -1939,7 +1950,9 @@ def build_ui() -> gr.Blocks:
                     with gr.Row():
                         st_cfg = gr.Slider(
                             0.0, 4.0, value=2.0, step=0.1, label="Guidance (CFG)",
-                            info="Default 2.0.",
+                            info="Default 2.0. Upstream #163 reports this has "
+                                 "no audible effect through the Python API — "
+                                 "change Quality steps instead.",
                         )
                         st_duration = gr.Number(
                             value=None, label="Duration (seconds)",

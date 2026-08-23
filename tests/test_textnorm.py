@@ -281,3 +281,44 @@ def test_a_pasted_document_survives_end_to_end():
         assert expected in out, (expected, out)
     for banned in ("#", "[", "]", "NARRATOR", "http", "- "):
         assert banned not in out, (banned, out)
+
+
+# --- chunk sizing: short chunks are the dangerous ones ---------------------
+def test_no_chunk_is_ever_left_undersized():
+    """Upstream #229/#206: the cloned voice switches speaker — sometimes
+    gender — on short generations, and "longer sentences appear more stable".
+    A three-word chunk is also where the measured batch was most rushed."""
+    text = ("Absolutely damning. Yes. He knew. "
+            + "This is a much longer sentence that carries most of the text. " * 3)
+    chunks = textnorm.chunk_text(text, max_chars=200)
+    assert all(len(c) >= 60 for c in chunks), [len(c) for c in chunks]
+
+
+def test_short_fragments_are_merged_not_emitted_alone():
+    chunks = textnorm.chunk_text("Me. Yes. No. Stop. Go.", max_chars=200)
+    assert len(chunks) == 1, chunks
+
+
+def test_merging_respects_the_ceiling():
+    long_one = "word " * 60                       # ~300 chars, one sentence
+    chunks = textnorm.chunk_text(long_one.strip() + ". Short.", max_chars=200)
+    assert max(len(c) for c in chunks) <= int(200 * 1.6) + 20, [len(c) for c in chunks]
+
+
+def test_chunking_still_splits_genuinely_long_text():
+    text = "This is a complete sentence of moderate length. " * 20
+    chunks = textnorm.chunk_text(text, max_chars=200)
+    assert len(chunks) > 3
+    assert all(len(c) <= 320 for c in chunks), [len(c) for c in chunks]
+
+
+def test_space_before_punctuation_is_opt_in():
+    src = "Hola, esto es una prueba."
+    assert norm(src) == "Hola, esto es una prueba."
+    textnorm.SPACE_BEFORE_PUNCT = True
+    try:
+        out, notes = textnorm.normalize_text(src, "Spanish", level="full")
+        assert " ," in out and " ." in out, out
+        assert any("space-before-punctuation" in n for n in notes)
+    finally:
+        textnorm.SPACE_BEFORE_PUNCT = False

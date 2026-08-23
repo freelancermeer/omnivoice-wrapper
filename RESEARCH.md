@@ -5,7 +5,7 @@ that our own batch did not show?** Our four bug documents came from one machine,
 three voices and 63 clips. This is what everyone else running zero-shot voice
 cloning in production has hit, and what regulators have started to require.
 
-Six gaps came out of it. Four are now fixed, two are open risks you should
+Nine gaps came out of it. Four are now fixed, two are open risks you should
 decide about deliberately. There is also a legal section, because you said you
 are selling this to the public — that part is not optional any more.
 
@@ -197,7 +197,68 @@ is the single biggest remaining prosody win.
 
 ---
 
-## 7. Still open — decide these deliberately
+## 7. Reading the upstream issue tracker — 250+ issues, open and closed
+
+Everything below is a real report on `k2-fsa/OmniVoice`. This matters because
+**most of what our batch found is a known model-level behaviour, not something
+our wrapper caused** — and several of them are still open, which tells you what
+can and cannot be fixed above the model.
+
+### The ones that change our code
+
+| Issue | State | What it says | What we did |
+|---|---|---|---|
+| [#229](https://github.com/k2-fsa/OmniVoice/issues/229) → [#206](https://github.com/k2-fsa/OmniVoice/issues/206) | closed, unresolved | **The cloned voice switches speaker — sometimes gender — on short generations.** "Most reproducible when generating multiple short sentences separately. Longer sentences appear more stable." Raising steps 32 → 64 did not help. | **The single most useful finding.** Chunk target raised 100 → 200 chars and *no chunk below 66 is ever emitted* — short ones are merged into a neighbour. Fewer, longer chunks are both steadier **and** faster. |
+| [#218](https://github.com/k2-fsa/OmniVoice/issues/218) | closed | A user measured "~15-20% slower … missing `torch.inference_mode()`". The maintainer replied that **`generate()` is already decorated with `@torch.inference_mode()`**, so the context propagates. | Killed a free-speed theory before we chased it. Our own `inference_mode` wrapper is belt-and-braces, not a win — the ASR and prompt-building calls still benefit. |
+| [#163](https://github.com/k2-fsa/OmniVoice/issues/163) | closed | **`guidance_scale` produces no audible difference** through the Python API — 0.0 to 4.0 identical — while `speed` and `num_step` work. | The CFG slider now says so. Tune **steps**, not guidance. |
+| [#116](https://github.com/k2-fsa/OmniVoice/issues/116) | closed | Spanish **drops the final vowel or consonant before commas and periods**. Workaround: put a space before the punctuation (`"prueba ."`). No maintainer reply. | Added as an opt-in lever, `OMNIVOICE_SPACE_BEFORE_PUNCT=1`. It changes every string and was never confirmed, so it is off by default — A/B it with `tools/audit_batch.py`. |
+| [#194](https://github.com/k2-fsa/OmniVoice/issues/194) | closed | OmniVoice's own `audio_post_process` fade in/out "sometimes adds artifact". | Argues for keeping our own joining and padding, and for testing with `Postprocess output` off. |
+
+### The ones that confirm our batch was not unlucky
+
+| Issue | State | |
+|---|---|---|
+| [#253](https://github.com/k2-fsa/OmniVoice/issues/253) | **open** | "Voice cloning generation **skips/drops parts of the input text** … happens randomly, not on every generation, **even with short text**." Our 12 dropped words, upstream and unfixed. |
+| [#245](https://github.com/k2-fsa/OmniVoice/issues/245), [#204](https://github.com/k2-fsa/OmniVoice/issues/204) | open / closed | "Generated audio frequently **cuts off the end of the sentence**." "Sometimes … cut the last word — I think it's because OV tries to fit wav to a fixed size." |
+| [#153](https://github.com/k2-fsa/OmniVoice/issues/153) | closed | "**ref text will be included in the final audio output** … there was a chance." Closed with no fix. Reference bleed is a model behaviour; catching and trimming it is the only defence. |
+| [#248](https://github.com/k2-fsa/OmniVoice/issues/248) | **open** | "**Speaking speed within a single generation is sometimes not consistent** … roughly 10% of the time", on 3090, 4090 and 5090 alike. Our 133-203 wpm spread is this. |
+| [#237](https://github.com/k2-fsa/OmniVoice/issues/237), [#210](https://github.com/k2-fsa/OmniVoice/issues/210), [#246](https://github.com/k2-fsa/OmniVoice/issues/246) | open / closed | Inconsistent pronunciation of the same word across generations. `lexicon.json` is the lever. |
+| [#134](https://github.com/k2-fsa/OmniVoice/issues/134) | closed | "Voice cloning sometimes **repeats words**." The insertion side of the verifier. |
+| [#50](https://github.com/k2-fsa/OmniVoice/issues/50) | | 60 s reference → "sounds like the speaker is having a stroke and **fails to output about 1/4th of the words**"; ~6 s is great. |
+| [#140](https://github.com/k2-fsa/OmniVoice/issues/140), [#118](https://github.com/k2-fsa/OmniVoice/issues/118) | closed | Distortion with a *too short* reference; trouble synthesising very short clips. Both ends of our 3-15 s window are real. |
+| [#144](https://github.com/k2-fsa/OmniVoice/issues/144), [#31](https://github.com/k2-fsa/OmniVoice/issues/31), [#73](https://github.com/k2-fsa/OmniVoice/issues/73) | closed / open | Crackling, static and non-speech audio. Why chunking exists, and why sanitising the script matters. |
+| [#181](https://github.com/k2-fsa/OmniVoice/issues/181) | closed | A real bug in OmniVoice's own `utils/text.py`: `END_PUNCTUATION` silently dropped members. Its text handling is not a foundation to build on — which is why `textnorm.py` is ours. |
+
+### Memory, and the ceiling on RTF
+
+[**#199**](https://github.com/k2-fsa/OmniVoice/issues/199) is **open**: "GPU memory grows with each `generate()` call … `empty_cache()` does not fully recover", reproduced on a 5060 Ti, and one user reports VRAM climbing **from 5 GB to nearly 20 GB over three weeks** of continuous running. [#180](https://github.com/k2-fsa/OmniVoice/issues/180) is the same in Chinese. **This is your OOM, it is upstream, and it is not fixed.** Everything in `gpu_guard.py` is damage control around a library leak — which is exactly why `/api/ready` and the auto-reload exist.
+
+On speed, the interesting numbers come from a community C++ runtime rather than
+from tuning Python:
+
+* [**#201**](https://github.com/k2-fsa/OmniVoice/issues/201) / [**#233**](https://github.com/k2-fsa/OmniVoice/issues/233) — `audio.cpp`, a GGML build with no Python dependencies: **1.3-1.5× faster than Python**, and **RTF 0.0232 on an RTX 5090** with Q8 + performance mode (~43× real time).
+* On the #199 thread the same author reports a **6,026-character input → 357 s of audio in 17.77 s wall time, RTF 0.050**, with a **stable memory footprint**.
+* [#102](https://github.com/k2-fsa/OmniVoice/issues/102) asked about CUDA graphs and got no answer. [#216](https://github.com/k2-fsa/OmniVoice/issues/216) asked what hardware the headline RTF 0.025 was measured on — also unanswered.
+
+So the honest ceiling: **inside Python there is no large RTF win waiting.** The
+inference loop is already in `inference_mode`, guidance does nothing, and the
+only reported step change is a different runtime. If RTF ever becomes the
+binding constraint, `audio.cpp` is the direction — and it would fix the VRAM
+leak at the same time.
+
+### What cannot be built above the model
+
+[**#241**](https://github.com/k2-fsa/OmniVoice/issues/241) (and its duplicate #240) asks for exactly the
+ElevenLabs feature from §6 — "passing the previous sentence as context … an
+internal generation state" — because splitting text "results in unnatural
+prosody, abrupt transitions, and inconsistent intonation between sentences".
+**Open, no maintainer reply.** There is no context parameter to call, so the
+best available answer really is: one shared voice prompt, larger chunks, and
+careful joining. All three are now in place.
+
+---
+
+## 8. Still open — decide these deliberately
 
 ### Two speakers in one reference — **not implemented**
 
