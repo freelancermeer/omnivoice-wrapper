@@ -12,8 +12,8 @@ Keep updating the numbers here rather than rewriting the file.
 
 | Sawal | Jawab |
 |---|---|
-| **RTF kitna hai?** | **0.203** verification ke saath, **0.151** uske baghair. Purana 0.16 asal me *unverified* number tha — verification band karo to wo wapas aa jata hai. |
-| **Verification ka cost?** | **~35 %** (32–37 % realistic lengths pe). Docs me 15–20 % ka andaza tha — asli cost double hai. |
+| **RTF kitna hai?** | **0.170** verification ke saath (long-form), **0.151** uske baghair. Purana 0.16 asal me *unverified* number tha. Subah ye 0.300 tha — verifier ki ASR windows batch karne se 0.226, phir batch 12 pe 0.170. |
+| **Verification ka cost?** | **12.6 %** long-form pe (0.170 vs 0.151), aur ~35 % chhoti clips ke batch pe jahan fixed overhead ghaalib hai. Subah ye ~100 % tha. |
 | **Audit: added / dropped?** | **0 added, 0 dropped, 0 % trailing artefact**, 25/25 clean clips. Pehle 218 aur 12 the. |
 
 Do lafz farq the — `Bessent` → "besant", `authorisation` → "authorization" —
@@ -122,3 +122,49 @@ venv\Scripts\python tools\audit_batch.py manifest.json --out audit.json
 `rtf_probe.py` RTF ko clip length ke against naapta hai — ek akela RTF number is
 server ke liye be-matlab hai, kyunke chhoti clip pe fixed cost hi ghalib rehti
 hai.
+
+
+---
+
+## Doosri session (24 August) — RTF, aur teen dead ends
+
+Poora hisab **[GPU_RUN.md](GPU_RUN.md)** me hai. Yahan sirf faisle:
+
+| kis pe | koshish | nateeja |
+|---|---|---|
+| verification | ASR windows batch karna | 0.300 → 0.226 |
+| verification | batch 8 → 12 | 0.226 → **0.170** |
+| verification | clock-time / currency ke jhoote alarm | ek clip 0.548 → 0.244 |
+| verification | plural (`memory`/`memories`) ka jhoota alarm | ek regeneration kam |
+| verification | faster-whisper runtime | speed same, **−1.6 GB VRAM** |
+| verification | generation ke peeche chhupana | **reject** — dono GPU-bound |
+| generation | FlashInfer | **namumkin** — NCCL Windows pe hai hi nahi |
+| generation | torch.compile | **2x slower** — har nayi length pe recompile |
+| poora GPU | Parsec band karna | ~25 % mumkin, deployment ka faisla |
+
+```
+RTF 0.170  =  0.151 generation  +  0.019 verification
+```
+
+Verification ka hissa ab chhota hai. Baqi 0.151 OmniVoice khud hai, eager
+PyTorch me, Ampere card pe — aur us se aage har documented raasta Linux maangta
+hai.
+
+## Aur kya badla
+
+* **Do instance ek saath nahi chal saktin.** `run.bat` dobara chalane pe ab
+  model load hone se **pehle** ruk jata hai (8.5 s, VRAM chhue baghair) —
+  pehle wo chup-chaap doosra model load kar leta tha aur "UI buggy hai" jaisa
+  lagta tha.
+* **Voices dobara banayi gayin** teen asli clips se, plain naamon ke saath.
+  Purani `voices/` ki copy `voices_backup_<timestamp>/` me hai — wo original
+  10.000 s clips ki **wahid copy** hai, delete mat karna.
+* **`tools/verify_external.py`** — apne verdict ko AssemblyAI se cross-check
+  karta hai. Das clips: Whisper 10/10 clean, AssemblyAI 9/10, 9/10 par ittefaq.
+
+## Verify on rakhein ya off?
+
+**On.** Farq detect ka nahi, **repair** ka hai: `tools/audit_batch.py` wohi
+defects baad me pakad leta hai, magar on hone pe kharab chunk **run ke doran
+khud dobara banta hai** aur caller tak pahunchta hi nahi. 12.6 % pe wo sasta
+bima hai.

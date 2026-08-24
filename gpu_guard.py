@@ -128,14 +128,6 @@ def snapshot() -> Dict:
         return {"device": "cuda", "error": f"{type(e).__name__}: {e}"}
 
 
-def reset_peak() -> None:
-    if torch is not None and torch.cuda.is_available():
-        try:
-            torch.cuda.reset_peak_memory_stats()
-        except Exception:  # pragma: no cover
-            pass
-
-
 @contextmanager
 def inference():
     """`inference_mode` where available — without it autograd keeps every

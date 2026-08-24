@@ -344,12 +344,6 @@ def prepare_reference(path: str, normalize: bool = True) -> Tuple[str, Dict]:
     return tmp, info
 
 
-def trim_reference(path: str):
-    """Back-compat shim: (path_to_use, duration_seconds, was_trimmed)."""
-    prepared, info = prepare_reference(path)
-    return prepared, info.get("duration_sec"), bool(info.get("trimmed"))
-
-
 # ---------------------------------------------------------------------------
 # Audit trail
 # ---------------------------------------------------------------------------
@@ -2263,24 +2257,6 @@ def zip_all():
 # ---------------------------------------------------------------------------
 # Custom Gradio UI
 # ---------------------------------------------------------------------------
-def _build_instruct(groups):
-    """Turn Voice-Design dropdown selections into an instruct string."""
-    selected = [g for g in groups if g and g != "Auto"]
-    if not selected:
-        return None
-    parts = []
-    for v in selected:
-        if " / " in v:
-            en, zh = v.split(" / ", 1)
-            if "Dialect" in v.split(" / ")[0]:
-                parts.append(zh.strip())
-            else:
-                parts.append(en.strip())
-        else:
-            parts.append(v)
-    return ", ".join(parts)
-
-
 def _lang_dropdown(label="Language (optional) / 语种 (可选)"):
     return gr.Dropdown(
         label=label,
