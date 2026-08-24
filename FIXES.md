@@ -185,11 +185,11 @@ REM 0. Upgrade omnivoice 0.1.5 -> 0.2.1. The app warns loudly if you skip this.
 venv\Scripts\python -m pip install -r requirements.txt
 venv\Scripts\python -m pip install pytest requests
 
-REM 1. No GPU needed. Should be 58 passed.
+REM 1. No GPU needed. Should be 131 passed.
 venv\Scripts\python -m pytest tests -q
 
 REM 2. Start the app and watch the banner line:
-REM    verify=on · normalize=full · loudness=on (-20 LUFS) · concurrency=1
+REM    verify=OFF (audit with tools/audit_batch.py) · normalize=full · loudness=on (-20 LUFS) · concurrency=1
 run.bat
 
 REM 3. Re-register your three voices — the stored clips are repaired on the way in.

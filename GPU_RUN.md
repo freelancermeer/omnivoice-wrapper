@@ -328,7 +328,7 @@ Being straight about what this run did **not** establish:
 
 ```powershell
 venv\Scripts\python -m pip install -r requirements.txt
-venv\Scripts\python -m pytest tests -q                    REM 104 passed
+venv\Scripts\python -m pytest tests -q                    REM 131 passed
 run.bat
 
 curl -X POST http://127.0.0.1:8001/api/voices -F "name=RVoiceover_3" -F "voice=@voices\RVoiceover_3.wav"

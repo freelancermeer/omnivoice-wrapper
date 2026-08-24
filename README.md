@@ -206,8 +206,9 @@ overhead, and warm voices skip the embedding build. A one-line clip will always
 show a worse RTF than a paragraph — that is arithmetic, not a fault.
 
 **Measured on the reference box** (RTX 3060 Ti 8 GB, 16 steps, verification on):
-long-form **RTF ~0.17**, 240-word clips ~0.18, 60-word clips ~0.19. Ten minutes
-of finished audio renders in under two minutes. Full numbers and method in
+long-form **RTF ~0.15** at the current defaults (checking off), **~0.17** with
+per-clip checking on. Ten minutes of finished audio renders in about a minute
+and a half. Full numbers and method in
 [GPU_RUN.md](GPU_RUN.md).
 
 **What is not available here:** upstream PR #239 (FlashInfer, "2.1x at batch

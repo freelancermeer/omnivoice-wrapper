@@ -12,8 +12,8 @@ Keep updating the numbers here rather than rewriting the file.
 
 | Sawal | Jawab |
 |---|---|
-| **RTF kitna hai?** | **0.170** verification ke saath (long-form), **0.151** uske baghair. Purana 0.16 asal me *unverified* number tha. Subah ye 0.300 tha — verifier ki ASR windows batch karne se 0.226, phir batch 12 pe 0.170. |
-| **Verification ka cost?** | **12.6 %** long-form pe (0.170 vs 0.151), aur ~35 % chhoti clips ke batch pe jahan fixed overhead ghaalib hai. Subah ye ~100 % tha. |
+| **RTF kitna hai?** | **0.143-0.151** maujooda default pe (checking off). Checking on karein to long-form **0.170**. Purana 0.16 asal me *unverified* number tha — wahi ab default hai. |
+| **Verification ka cost?** | **12.6 %** long-form pe (0.170 vs 0.151), aur ~26-35 % chhoti clips ke batch pe. Ab default **off** hai; batch ke baad `tools/audit_batch.py`. |
 | **Audit: added / dropped?** | **0 added, 0 dropped, 0 % trailing artefact**, 25/25 clean clips. Pehle 218 aur 12 the. |
 
 Do lafz farq the — `Bessent` → "besant", `authorisation` → "authorization" —
@@ -65,7 +65,7 @@ Chaar sirf hardware pe hi mil sakte thay:
 ## Stability
 
 `tools/acceptance.py` → **35 passed, 0 failed, 1 skipped**.
-`pytest tests -q` → **104 passed**.
+`pytest tests -q` → **131 passed**.
 
 73 generations me: **0 OOM, 0 model reloads, 0 verify failures/skips**, soak ke
 baad **+0 MB allocated aur +0 MB reserved**, fragmentation 151 MB (gate 800).
@@ -78,9 +78,9 @@ golden-file tests yahan sach me kaam karte hain.
 
 ## Ab faisla aapka hai
 
-Verification RTF **0.151 → 0.203** le jati hai. Badle me server aapko bata deta
-hai ke koi lafz gir gaya. Lever: `OMNIVOICE_VERIFY=0`, aur phir batch ke baad
-`tools\audit_batch.py` se ek hi pass me poora check.
+> **Ye faisla ho chuka hai — neeche "Verify ab default OFF hai" dekhein.**
+> Ye section us waqt ka hai jab checking default on thi; numbers bhi purane
+> hain (0.203 ab 0.170 hai).
 
 Mera mashwara: **on rakhein.** 35 % ki qeemat us se kam hai jo ek dropped word
 customer ki cut hui video me pakde jane par lagti hai — aur ab regenerations 0
@@ -162,9 +162,27 @@ hai.
 * **`tools/verify_external.py`** — apne verdict ko AssemblyAI se cross-check
   karta hai. Das clips: Whisper 10/10 clean, AssemblyAI 9/10, 9/10 par ittefaq.
 
-## Verify on rakhein ya off?
+## Verify ab default OFF hai
 
-**On.** Farq detect ka nahi, **repair** ka hai: `tools/audit_batch.py` wohi
-defects baad me pakad leta hai, magar on hone pe kharab chunk **run ke doran
-khud dobara banta hai** aur caller tak pahunchta hi nahi. 12.6 % pe wo sasta
-bima hai.
+`OMNIVOICE_VERIFY=0` aur `OMNIVOICE_VERIFY_RETRIES=0`. Ye faisla naapa gaya
+hai, farz nahi:
+
+* Ek 19-clip batch me checking **26 % run** kha rahi thi, aur us ne jo bhi
+  "defect" bataya wo transcriber ki apni spelling thi — `advisers`/`advisors`,
+  `behavior`/`behaviour`, `lockup`/`lock up`. **Unnees clips me ek bhi asli
+  gira hua lafz nahi.**
+* Har aisa "defect" ek regeneration **aur** poori clip ki dobara verification
+  khareed raha tha.
+* Yahan naapa gaya: 10-clip batch **24s vs 27s**, best RTF **0.143 vs 0.174**,
+  aur usi output pe `tools/audit_batch.py` ne **0 added, 0 dropped** hi bataya.
+
+**Checking off hone pe bhi kya mehfooz hai:** reference bleed ab *source* pe
+ruka hua hai (reference mid-word khatam ho hi nahi sakti, mismatched `ref_text`
+registration pe 422), loudness/seams/padding ka verifier se ta'alluq tha hi
+nahi, aur GPU headroom check, 503 aur `/api/ready` sab mustaqil hain.
+
+**Asli trade detect ka nahi, repair ka hai:** kharab chunk ab run ke doran khud
+theek nahi hoga — aap ko pata chalega ke kaunsi clip kharab hai aur wo dobara
+render karni hogi.
+
+Kisi batch pe shak ho to: `set OMNIVOICE_VERIFY=1`

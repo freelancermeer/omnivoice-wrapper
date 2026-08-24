@@ -378,8 +378,8 @@ saying so is the unknown-parameter mechanism working, not a bug.
 
 ### Verification, and what it costs
 
-Every clip is transcribed back and diffed against the script before it is
-returned. That costs roughly **25–40 %** of render time depending on clip
+With checking on, every clip is transcribed back and diffed against the
+script before it is returned. It is **off by default** — see below. That costs roughly **25–40 %** of render time depending on clip
 length, and it is what puts `X-Verified`, `X-OmniVoice-Warning` and the
 `diff` block in the v2 response.
 
