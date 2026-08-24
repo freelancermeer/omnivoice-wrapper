@@ -150,6 +150,8 @@ Each row below is a measured finding and where it is handled.
 | Numbers, currency, em dashes, ordinals, acronyms. | A wrapper-owned text front-end ([`textnorm.py`](textnorm.py)), with the result returned in `X-OmniVoice-Normalized-Text` so it can be checked without listening. |
 | Retries after a client timeout paid for the same clip twice. | `Idempotency-Key` header; a replay returns the cached audio with `X-OmniVoice-Idempotent-Replay: true`. |
 | A typo in `voice_id` silently used a different voice. | **404, always.** Never a substitute. |
+| **A full card killed requests silently.** VRAM reached `free_mb: 0` with `reserved` above the card's own total, and every substantial request then died 26-41 s in returning nothing at all — no status, no body, no log, every counter zero. | Headroom is checked **before** work starts: **503 in 0.16 s** with `Retry-After` and a body naming the shortfall. cuBLAS/cuDNN allocation failures are now recognised and counted, `/api/ready` requires real headroom as well as a passing self-test, and `reserved` exceeding the card's total (CUDA spilling into system RAM) is reported as the restart-not-retry condition it is. |
+| **RTF said how much, never why.** 396 words in 27.8 s and 394 words in 50.1 s, same voice, same settings, two minutes apart — indistinguishable from outside. | Every clip explains itself: `X-RTF-Reason` / `rtf_reason` names the cause, `timing` splits the seconds by phase, `chunks` says how many were regenerated and why, and `/api/metrics` reports regeneration rate **per voice**, so a bad reference is attributable. |
 
 Earlier fixes that are still in place: reference trimming for GitHub #50,
 sentence chunking for #144, one shared voice prompt across chunks for #44, FP16

@@ -41,6 +41,11 @@ REM  Verifier ka transcriber CTranslate2 pe (pip install faster-whisper).
 REM  Speed barabar rehti hai, magar 1.6 GB VRAM bach jati hai kyunke
 REM  OmniVoice ka apna Whisper load hi nahi hota.
 REM set OMNIVOICE_ASR_BACKEND=faster
+REM  Itni VRAM free na ho to request foran 503 de do (35 second baad marne
+REM  ke bajaye). Default 700 MB.
+REM set OMNIVOICE_MIN_FREE_MB=700
+REM  Is se upar RTF ho to clip khud wajah batayegi. Default 0.26.
+REM set OMNIVOICE_RTF_NORMAL_MAX=0.26
 
 echo Starting OmniVoice Voiceover Studio...
 echo (pehli baar model load me ~10-20 sec lagte hain)

@@ -136,6 +136,30 @@ FW_MODEL = os.environ.get("OMNIVOICE_ASR_FW_MODEL",
 # Empty means auto-detect, which is what the transformers pipeline does.
 ASR_LANGUAGE = os.environ.get("OMNIVOICE_ASR_LANGUAGE", "").strip()
 
+# How much room the card must still have before a request is allowed to start.
+# A measured batch ran the card down to `free_mb: 0` with `reserved` at 9008 MB
+# on an 8191 MB card — CUDA had spilled into system RAM — and from then on any
+# request needing real memory died 26-41 s in, returning nothing at all: no
+# status, no body, no log line, every counter still zero. Refusing in
+# milliseconds with a Retry-After is strictly better than that, and it is the
+# difference between a client that can back off and one that cannot tell a
+# crash from a hang.
+MIN_FREE_MB = float(os.environ.get("OMNIVOICE_MIN_FREE_MB", "700"))
+# Rough per-word working set on top of the floor. In the same batch a 408-word
+# segment succeeded with ~3 GB free and a 164-word one failed with ~400 MB, so
+# the cost is real but modest; this only has to be good enough to refuse early.
+VRAM_PER_100_WORDS_MB = float(
+    os.environ.get("OMNIVOICE_VRAM_PER_100_WORDS_MB", "60"))
+# Marker on the status string so the API can turn this into a 503 rather than
+# a 500. Nothing else in the codebase produces it.
+VRAM_BLOCKED = "__vram_blocked__"
+
+
+def _estimate_vram_mb(text: str) -> float:
+    """What this request will want on top of the resident models."""
+    words = len(str(text or "").split())
+    return MIN_FREE_MB + (words / 100.0) * VRAM_PER_100_WORDS_MB
+
 # --- text front-end -------------------------------------------------------
 NORMALIZE_LEVEL = os.environ.get("OMNIVOICE_NORMALIZE_LEVEL", "").strip().lower()
 if not NORMALIZE_LEVEL:
@@ -246,6 +270,14 @@ QUEUE_WAIT_S = float(os.environ.get("OMNIVOICE_QUEUE_WAIT", "300"))
 AUTO_RELOAD = _env_flag("OMNIVOICE_AUTO_RELOAD")
 SELFTEST = _env_flag("OMNIVOICE_SELFTEST")
 SELFTEST_EVERY = float(os.environ.get("OMNIVOICE_SELFTEST_EVERY", "120"))
+# ~60 words: enough to chunk, allocate and exercise the same path a customer
+# request takes, without costing a meaningful share of the GPU's day.
+SELFTEST_TEXT = os.environ.get("OMNIVOICE_SELFTEST_TEXT", "").strip() or (
+    "The committee reconvened after lunch and the questions changed shape "
+    "entirely. What had been an argument about paperwork became an argument "
+    "about who knew what, and when. The chair asked for the ledger twice "
+    "before anyone moved, and the room stayed quiet until she read the second "
+    "paragraph aloud herself.")
 SELFTEST_STALE = float(os.environ.get("OMNIVOICE_SELFTEST_STALE", "600"))
 
 
@@ -390,7 +422,43 @@ def audit_generation(text, rep, voice_id=None, owner=None, project=None,
           verified=rep.get("verified"),
           warnings=(rep.get("warnings") or None),
           watermarked=(rep.get("watermark") or {}).get("watermarked"),
-          rtf=rep.get("rtf"), seed=rep.get("seed"))
+          rtf=rep.get("rtf"), seed=rep.get("seed"),
+          rtf_reason=(rep.get("rtf_reason") or {}).get("summary"),
+          timing=rep.get("timing"),
+          chunks=rep.get("chunks"),
+          chunks_regenerated=len(rep.get("regen_chunks") or []),
+          vram_free_mb=rep.get("vram_at_start_mb"))
+    _record_voice_stats(voice_id, rep)
+
+
+# Per-voice chunk and regeneration counts. A voice whose chunks are rebuilt
+# more often than the others has a problem in its *reference*, not in the
+# script it was given — and that is something a customer can be told and can
+# act on, which a global counter never is.
+VOICE_STATS: Dict[str, Dict[str, int]] = {}
+VOICE_STATS_LOCK = threading.Lock()
+
+
+def _voice_stats_snapshot() -> Dict[str, Dict]:
+    """Regeneration rate per voice, so a bad reference is attributable."""
+    with VOICE_STATS_LOCK:
+        out = {}
+        for vid, st in VOICE_STATS.items():
+            chunks = max(st["chunks"], 1)
+            out[vid] = dict(st, regeneration_rate=round(
+                st["regenerated"] / chunks, 4))
+        return out
+
+
+def _record_voice_stats(voice_id, rep) -> None:
+    if not voice_id:
+        return
+    with VOICE_STATS_LOCK:
+        st = VOICE_STATS.setdefault(str(voice_id),
+                                    {"clips": 0, "chunks": 0, "regenerated": 0})
+        st["clips"] += 1
+        st["chunks"] += int(rep.get("chunks") or 1)
+        st["regenerated"] += len(rep.get("regen_chunks") or [])
 
 
 # ---------------------------------------------------------------------------
@@ -877,6 +945,71 @@ def _transcribe_many(waves, sr: int):
     return None
 
 
+# Above this, a clip is slower than this card's measured normal and owes an
+# explanation. Long-form sits at 0.17 and ordinary clips at 0.19-0.24, so 0.26
+# is "unremarkable" rather than "good". Anything past it says which of the
+# possible causes actually applied on this clip.
+RTF_NORMAL_MAX = float(os.environ.get("OMNIVOICE_RTF_NORMAL_MAX", "0.26"))
+
+
+def _explain_rtf(rep: Dict[str, Any], rtf: float, audio_sec: float) -> Dict[str, Any]:
+    """Why did this clip take as long as it did?
+
+    RTF says how much, never why, and the two expensive causes look identical
+    from outside: a card so short of memory that everything crawls, and a clip
+    whose chunks were quietly rebuilt five times. One is cured by restarting
+    the box, the other by fixing the voice's reference — and a number alone
+    sends you after the wrong one. Measured on a real batch: 396 words in
+    27.8 s and 394 words in 50.1 s, same voice, same settings, two minutes
+    apart, both reported only as "RTF".
+    """
+    t = rep.get("timing") or {}
+    causes: List[str] = []
+
+    regen_sec = float(rep.get("regen_sec") or 0.0)
+    regen_chunks = rep.get("regen_chunks") or []
+    total_chunks = int(rep.get("chunks") or 1)
+    if regen_chunks:
+        reasons = rep.get("regen_reasons") or {}
+        why = ", ".join(f"{k.replace('_', ' ')} x{v}" for k, v in sorted(reasons.items()))
+        causes.append(
+            f"{len(regen_chunks)} of {total_chunks} chunk(s) had to be generated "
+            f"again ({why}), costing {regen_sec:.1f}s")
+
+    verify_sec = float(t.get("verify_s") or 0.0)
+    gen_sec = float(t.get("generate_s") or 0.0)
+    if verify_sec and gen_sec and verify_sec > 0.35 * gen_sec:
+        causes.append(f"verification took {verify_sec:.1f}s against "
+                      f"{gen_sec:.1f}s of generation")
+
+    free_at_start = rep.get("vram_at_start_mb")
+    if free_at_start is not None and free_at_start < MIN_FREE_MB * 2:
+        causes.append(f"the card had only {free_at_start:.0f} MB free when this "
+                      f"clip started, so allocation was under pressure")
+    if gpu_guard.spilled_to_shared():
+        causes.append("VRAM has spilled into system memory — restart the server")
+
+    if audio_sec and audio_sec < 8.0:
+        causes.append(f"the clip is only {audio_sec:.1f}s long, so the fixed "
+                      f"per-request cost dominates the ratio")
+
+    prompt_sec = float(t.get("voice_prompt_s") or 0.0)
+    if prompt_sec > 1.0:
+        causes.append(f"the voice prompt was built from scratch ({prompt_sec:.1f}s) "
+                      f"— pre-warm the voice to skip this")
+
+    normal = rtf <= RTF_NORMAL_MAX and not causes
+    return {
+        "rtf": round(rtf, 3),
+        "normal": bool(normal),
+        "summary": ("normal" if normal else
+                    ("higher than usual: " + "; ".join(causes) if causes
+                     else "higher than usual, with no single cause identified")),
+        "causes": causes,
+        "normal_up_to": RTF_NORMAL_MAX,
+    }
+
+
 def _gen_core(*args, **kwargs):
     # The GPU lock is taken per model call (per chunk / per prompt / per
     # transcription), NOT around the whole job — so an upload-transcription can
@@ -910,9 +1043,29 @@ def _gen_core_impl(
     rep.setdefault("warnings", [])
     rep.setdefault("notes", [])
     rep.setdefault("verified", False)
+    # Every phase writes its own seconds here, so a slow clip can say which
+    # part was slow instead of leaving RTF to be guessed at.
+    timing: Dict[str, float] = rep.setdefault("timing", {})
+    t_start = time.perf_counter()
 
     if not text or not text.strip():
         return None, "Please enter the text to synthesize."
+
+    # ---- is there room to start at all? ---------------------------------
+    block = gpu_guard.headroom(_estimate_vram_mb(text), floor_mb=MIN_FREE_MB)
+    if block is not None:
+        _bump("vram_refusals")
+        rep["vram_block"] = block
+        log.warning("refusing before start: %.0f MB free, %.0f MB wanted%s",
+                    block["free_mb"], block["needed_mb"],
+                    " (spilled to shared memory)" if block["spilled_to_shared"] else "")
+        return None, (
+            f"{VRAM_BLOCKED}the GPU has {block['free_mb']:.0f} MB free and this "
+            f"clip needs about {block['needed_mb']:.0f} MB. "
+            + ("VRAM has spilled into system memory, which usually means the "
+               "server needs restarting. " if block["spilled_to_shared"] else "")
+            + "Nothing was generated; retry shortly.")
+    rep["vram_at_start_mb"] = gpu_guard.snapshot().get("free_mb")
 
     too_big = check_input_size(text, queued=True)
     if too_big:
@@ -925,7 +1078,9 @@ def _gen_core_impl(
         num_step = FORCE_NUM_STEP
         notes.append(f"steps forced to {FORCE_NUM_STEP}")
 
+    _t = time.perf_counter()
     syn_text, norm_notes = normalize_for_tts(text.strip(), language)
+    timing["normalize_s"] = round(time.perf_counter() - _t, 3)
     notes.extend(norm_notes)
     rep["normalized_text"] = syn_text
     rep["original_text"] = text.strip()
@@ -990,6 +1145,7 @@ def _gen_core_impl(
                                 "the clip had to be trimmed, so the transcript no "
                                 "longer matched the audio")
                 ref_text = None
+        _t = time.perf_counter()
         try:
             clone_prompt = call_model(
                 lambda: model.create_voice_clone_prompt(ref_audio=ref_path,
@@ -997,6 +1153,7 @@ def _gen_core_impl(
                 label="clone_prompt")
         except Exception as e:
             return None, f"Error creating voice prompt: {type(e).__name__}: {e}"
+        timing["voice_prompt_s"] = round(time.perf_counter() - _t, 3)
         if not ref_text:
             notes.append("ref text auto-transcribed (Whisper)")
 
@@ -1051,16 +1208,22 @@ def _gen_core_impl(
                 log.warning("Could not lock design voice across chunks: %s", e)
             parts += _generate(chunks[1:], clone_prompt, None, BATCH)
 
+        timing["generate_s"] = round(time.perf_counter() - t0, 3)
+
         # ---- did it say what it was sent? -------------------------------
         if VERIFY and not duration_set:
+            _t = time.perf_counter()
             parts = _verify_stage(
                 chunks, parts, rep,
                 regen=lambda t: _generate([t], clone_prompt, instruct_val, 1)[0],
                 cancel_check=cancel_check)
+            timing["verify_s"] = round(time.perf_counter() - _t, 3)
 
+        _t = time.perf_counter()
         waveform_f, join_info = audio_fx.join_chunks(
             parts, sampling_rate, gap_sec=GAP_SEC, level_match=LEVEL_MATCH,
             tail_pad_sec=OUT_TAIL_PAD)
+        timing["join_s"] = round(time.perf_counter() - _t, 3)
         rep["join"] = join_info
     except _Cancelled:
         return None, "Cancelled"
@@ -1113,6 +1276,8 @@ def _gen_core_impl(
         "rtf": round(rtf, 3), "wpm": measured_wpm, "words": spoken_words,
         "baseline_wpm": baseline_wpm,
     })
+    timing["total_s"] = round(time.perf_counter() - t_start, 3)
+    rep["rtf_reason"] = _explain_rtf(rep, rtf, audio_dur)
     # Speaking rate is a metric, never a gate: a documentary narrator runs ~100
     # wpm and an ads voice ~210, so any fixed band both rejects good clips and
     # passes broken ones. Compared against its own voice, it means something.
@@ -1275,11 +1440,23 @@ def _verify_and_repair(chunks, parts, rep, regen, cancel_check=None):
                and attempts < VERIFY_RETRIES):
             _bump("regenerations")
             attempts += 1
+            # Why this chunk is being made again, kept per clip. RTF alone
+            # cannot separate "the GPU was struggling" from "five chunks were
+            # silently rebuilt", and those have completely different cures.
+            reason = ("dropped_words" if diff.get("missing")
+                      else "extra_words" if diff.get("extra") else "unclear")
+            rep.setdefault("regen_reasons", {})
+            rep["regen_reasons"][reason] = rep["regen_reasons"].get(reason, 0) + 1
+            rep["regen_chunks"] = sorted(set(rep.get("regen_chunks", []) + [idx + 1]))
+            _t_regen = time.perf_counter()
             try:
                 candidate = regen(chunk)
             except Exception as e:  # noqa: BLE001
                 log.warning("regeneration failed: %s", e)
                 break
+            finally:
+                rep["regen_sec"] = round(
+                    rep.get("regen_sec", 0.0) + (time.perf_counter() - _t_regen), 3)
             try:
                 heard2 = _transcribe_audio(candidate, sampling_rate)
             except Exception:  # noqa: BLE001
@@ -1579,6 +1756,11 @@ def _jobs_html():
         voice = "🎤 cloned" if cloned else "🎛️ designed"
         # The timing note moves to its own uncropped row below; keep the rest.
         notes = "; ".join(n for n in rep.get("notes", []) if "RTF" not in n)
+        rtf_why = ""
+        if not (rep.get("rtf_reason") or {}).get("normal", True):
+            rtf_why = ('<div class="vq-warn">⏱️ why this one was slower: '
+                       + html_mod.escape(rep["rtf_reason"]["summary"])
+                       + "</div>")
         detail = notes or (f"{script_preview}…" if script_preview else "")
         if not detail and j["info"]:
             detail = j["info"]
@@ -1586,10 +1768,14 @@ def _jobs_html():
 
         chips = []
         rtf = rep.get("rtf")
+        reason = rep.get("rtf_reason") or {}
         if rtf:
-            # < 1.0 means faster than real time.
+            # < 1.0 means faster than real time; the colour follows whether
+            # this clip was normal for this card, not whether it beat 1.0.
+            good = reason.get("normal", rtf < 1.0)
             chips.append(f'<span class="vq-chip '
-                         f'{"vq-chip-good" if rtf < 1.0 else "vq-chip-slow"}">'
+                         f'{"vq-chip-good" if good else "vq-chip-slow"}" '
+                         f'title="{html_mod.escape(reason.get("summary", ""))}">'
                          f'⚡ RTF {rtf:.3f}</span>')
         if rep.get("audio_sec"):
             chips.append(f'<span class="vq-chip">🕑 {rep["audio_sec"]:.1f}s audio</span>')
@@ -1623,7 +1809,7 @@ def _jobs_html():
             f'<span class="vq-id">#{j["id"]}</span>'
             f'<div class="vq-meta"><div class="vq-name">{name}</div>'
             f'<div class="vq-sub">{sub}</div>'
-            f'{metrics_line}{ref_line}{warn_line}{dl}</div>'
+            f'{metrics_line}{ref_line}{rtf_why}{warn_line}{dl}</div>'
             f'</div>'
             f'<div class="vq-right">'
             f'<span class="vq-badge {cls}">{icon} {status}</span>'
@@ -2692,7 +2878,12 @@ def _run_selftest(idle_only: bool = False) -> Optional[Tuple[bool, str]]:
     t0 = time.monotonic()
     try:
         rep: Dict[str, Any] = {}
-        out, status = _gen_core("Testing one two three.", None, None, None,
+        # Long enough to need real memory. Four words succeed on a card with
+        # nothing left -- measured: nine words returned 200 in 4.7s at the same
+        # moment a 164-word request was dying -- so a four-word probe answers a
+        # question nobody asked. A self-test is only worth the GPU time if it
+        # does roughly what a real request does.
+        out, status = _gen_core(SELFTEST_TEXT, None, None, None,
                                 8, 2.0, True, 1.0, None, True, True,
                                 mode="design", report=rep)
         if out is None:
@@ -2844,6 +3035,13 @@ def _build_api():
                 mode=mode, ref_text=None, prebuilt_prompt=prebuilt, report=rep,
                 seed=seed, baseline_wpm=baseline)
         if out is None:
+            if isinstance(status, str) and status.startswith(VRAM_BLOCKED):
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "insufficient_vram",
+                            "message": status[len(VRAM_BLOCKED):],
+                            **(rep.get("vram_block") or {})},
+                    headers={"Retry-After": "30"})
             if not HEALTH.ok:
                 raise HTTPException(
                     status_code=503,
@@ -2865,6 +3063,13 @@ def _build_api():
             "X-LUFS": f"{(rep.get('loudness') or {}).get('out_lufs', '')}",
             "X-True-Peak-dB": f"{(rep.get('loudness') or {}).get('true_peak_db', '')}",
             "X-Verified": "true" if rep.get("verified") else "false",
+            "X-Gen-Sec": f"{(rep.get('timing') or {}).get('generate_s', 0):.2f}",
+            "X-Verify-Sec": f"{(rep.get('timing') or {}).get('verify_s', 0):.2f}",
+            "X-Regen-Sec": f"{rep.get('regen_sec', 0):.2f}",
+            "X-Chunks": str(rep.get("chunks", 1)),
+            "X-Chunks-Regenerated": str(len(rep.get("regen_chunks") or [])),
+            "X-VRAM-Free-MB": f"{rep.get('vram_at_start_mb') or 0:.0f}",
+            "X-RTF-Reason": _hdr((rep.get("rtf_reason") or {}).get("summary", "")),
             "X-OmniVoice-API-Version": API_VERSION,
             "X-OmniVoice-Normalized-Text": _hdr(rep.get("normalized_text")),
             "Content-Disposition": f'attachment; filename="{_safe_name(project)}.{ext}"',
@@ -2891,8 +3096,17 @@ def _build_api():
             "baseline_wpm": rep.get("baseline_wpm"),
             "loudness": rep.get("loudness"),
             "rtf": rep.get("rtf"),
+            "rtf_reason": rep.get("rtf_reason"),
             "gen_sec": rep.get("gen_sec"),
-            "chunks": rep.get("chunks"),
+            "timing": rep.get("timing"),
+            "chunks": {
+                "total": rep.get("chunks"),
+                "regenerated": len(rep.get("regen_chunks") or []),
+                "which": rep.get("regen_chunks") or [],
+                "regeneration_reasons": rep.get("regen_reasons") or {},
+                "regenerate_s": rep.get("regen_sec", 0.0),
+            },
+            "vram_at_start_mb": rep.get("vram_at_start_mb"),
             "seed": rep.get("seed"),
             "api_version": API_VERSION,
         }
@@ -2910,10 +3124,29 @@ def _build_api():
         Point a load balancer at this one, not /api/live.
         """
         state = READY.as_dict()
+        snap = gpu_guard.snapshot()
         body = {"status": "ok" if state["ready"] else "degraded",
                 **state, "queue_depth": _queue_depth(),
-                "vram": gpu_guard.snapshot(), **HEALTH.as_dict()}
-        if not state["ready"]:
+                "vram": snap, **HEALTH.as_dict()}
+
+        # A self-test that passed is not enough on its own. In the measured
+        # batch this endpoint answered "ok" for the whole session while
+        # free_mb was 0 and every substantial request was dying — because four
+        # words still generate fine on a card with nothing left. Headroom is a
+        # separate question from "did the model answer", and both have to hold.
+        free = snap.get("free_mb")
+        reasons = []
+        if free is not None and snap.get("device") == "cuda" and free < MIN_FREE_MB:
+            reasons.append(f"only {free:.0f} MB of VRAM free "
+                           f"(need {MIN_FREE_MB:.0f} MB to start work)")
+        if gpu_guard.spilled_to_shared():
+            reasons.append("VRAM has spilled into system memory; restart the server")
+        if reasons:
+            body["status"] = "degraded"
+            body["ready"] = False
+            body["reason"] = "; ".join(reasons)
+
+        if not body["ready"]:
             return JSONResponse(status_code=503, content=body,
                                 headers={"Retry-After": "30"})
         return body
@@ -2970,7 +3203,15 @@ def _build_api():
                                if audio_total > 0 else None)
         snap.update({"queue_depth": _queue_depth(),
                      "uptime_s": round(time.time() - STARTED_AT, 1),
-                     "vram": gpu_guard.snapshot(), **HEALTH.as_dict()})
+                     # Regeneration rate per voice. A global count says the
+                     # model is struggling; a per-voice one says *which
+                     # reference* is struggling, which is the half a customer
+                     # can actually act on.
+                     "per_voice": _voice_stats_snapshot(),
+                     "vram": gpu_guard.snapshot(),
+                     "expandable_segments": gpu_guard.expandable_segments_state(),
+                     "spilled_to_shared": gpu_guard.spilled_to_shared(),
+                     **HEALTH.as_dict()})
         return snap
 
     # ---- voices ----------------------------------------------------------

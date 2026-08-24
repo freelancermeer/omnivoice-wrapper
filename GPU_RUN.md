@@ -849,3 +849,125 @@ The verification half went from ~100 % overhead this morning to **12.6 %**. The
 generation half is, on this hardware and this OS, where it is. The remaining
 0.151 is OmniVoice in eager PyTorch on an Ampere card, and every documented way
 past it needs Linux.
+
+
+---
+
+# The silent-death report, item by item
+
+A batch of 5 videos / 63 segments / ~10,000 words reported VRAM climbing to
+9008 MB on an 8191 MB card, `free_mb: 0`, and every substantial request after
+that dying 26-41 s in with **no status code, no body, no log line and every
+counter at zero**. Its five asks, and what each one is now.
+
+## 1. Catch allocation failure in any shape — done
+
+`torch.cuda.OutOfMemoryError` is the tidiest shape and not the common one.
+cuBLAS and cuDNN allocate their workspaces outside torch's caching allocator
+and report failure in their own words, as plain `RuntimeError`s. Matching only
+the tidy class is precisely why a whole session recorded `oom_total: 0` while
+three segments died repeatedly.
+
+`gpu_guard.is_allocation_failure()` now also matches `CUBLAS_STATUS_ALLOC_FAILED`,
+`CUDNN_STATUS_ALLOC_FAILED`, `cudaErrorMemoryAllocation`,
+`CUDA_ERROR_OUT_OF_MEMORY` and "failed to allocate", and it is what both the
+retry path and the health counter use. Verified against each string.
+
+## 2. Check before starting, not after dying — done
+
+`gpu_guard.headroom()` runs before any GPU work, attempts a cache release
+first, and refuses only if the memory genuinely is not there.
+
+Measured: **503 in 0.16 s**, with `Retry-After: 30` and a body naming
+`free_mb`, `needed_mb`, `short_by_mb`, `fragmentation_mb` and
+`spilled_to_shared`. Against a 26-41 s silence returning nothing, that is the
+difference between a client that can back off and one that cannot tell a crash
+from a hang. Counted as `vram_refusals`.
+
+### A new signal: `spilled_to_shared`
+
+The report's sharpest number is `reserved: 9008` on an `8191` MB card, which is
+physically impossible — CUDA had started backing "VRAM" with system RAM, which
+on Windows (WDDM) the driver does silently. Nothing raises; it just gets slower
+until something gives up mid-request. `reserved` exceeding the card's own total
+is the tell, it is now checked, and it is the one condition a `Retry-After`
+cannot fix: the answer is a restart, and both `/api/ready` and the 503 body say
+so.
+
+## 3. `/api/ready` must need headroom too — done
+
+It answered `ok` for the whole session while `free_mb` was 0, because four
+words still generate fine on a card with nothing left. Readiness now requires
+**both** a passing self-test and real headroom, and says which one failed:
+
+```json
+{"status": "degraded", "ready": false,
+ "reason": "only 412 MB of VRAM free (need 700 MB to start work)"}
+```
+
+The self-test also generates ~60 words instead of four. The report measured
+nine words returning 200 in 4.7 s at the same moment a 164-word request was
+dying — a probe that does less than a real request answers a question nobody
+asked.
+
+## 4. Find the leak — **it does not reproduce on this code**
+
+This is the one that is not closed, and saying otherwise would be worth
+nothing. `tools/soak_vram.py` runs the report's own test against the live
+server, reading `reserved` before the cache release as well as after:
+
+| soak | generations | reserved | free |
+|---|---|---|---|
+| short clips | 24 | 3672 → **3672 MB** (+0) | 3372 → 3372 |
+| long-form, 23 chunks each, 2 regenerations | 5 | 3672 → **3672 MB** (+0) | 3372 → 3372 |
+
+Flat, and `spilled_to_shared` false throughout. So the growth the report
+measured did not happen here.
+
+One difference is large enough to be worth stating as a hypothesis rather than
+a conclusion. That run recorded **`regenerations: 74` against `generations: 150`**
+— close to half the work being redone. The same soak here regenerated **2 chunks
+out of 115 (1.7 %)**, because the false-alarm classes fixed earlier the same day
+(digits read as words, clock times, inferred currency symbols, bare plurals)
+were each buying full regenerations. Seventy-four extra generations is seventy-four
+extra allocation cycles, and a leak proportional to that would look exactly like
+what was reported.
+
+**That is a hypothesis, not a finding.** If the growth returns, `soak_vram.py`
+is the way to catch it, and `OMNIVOICE_ASR_DEVICE=cpu` remains the first thing
+to try, as the report suggests.
+
+## 5. Say *why* a clip was slow — done
+
+See `LOCAL_API.md` §5c for the full contract. Short version: `X-RTF-Reason` and
+the `rtf_reason` block name the cause, `timing` breaks the seconds down by
+phase, `chunks` says how many were regenerated, which ones and why, and
+`vram_at_start_mb` says what the card had when the clip began.
+
+It earned its place immediately. A long-form clip that would previously have
+reported only `RTF 0.431` now reports:
+
+> 2 of 23 chunk(s) had to be generated again (dropped words x2), costing 3.3 s;
+> verification took 49.6 s against 36.4 s of generation
+
+That second clause is a finding in itself: **verification is cheap when it
+finds nothing and expensive when it does.** A clean long-form clip verifies in
+about 5 s; one where the screening pass finds a problem re-reads all 23 chunks
+individually and costs 49.6 s. The 12.6 % figure elsewhere in this document is
+the clean case, and it is not the whole story.
+
+`/api/metrics` also gains `per_voice`, because a global regeneration count says
+the model is struggling while a per-voice one says which **reference** is —
+which is the half a customer can act on.
+
+## And the machine shut down twice more
+
+Both were **mains power cuts**, confirmed by the user while a long-form run was
+in flight: the log stops mid-generation with no traceback, and Windows records
+no application crash — which is what losing power looks like and is not what a
+process crash looks like.
+
+That also corrects an earlier note in this document, which read Kernel-Power 41
+plus a cool GPU as marginal power delivery and suggested capping the card with
+`nvidia-smi -pl 150`. The cause is upstream of the PSU. **A UPS is the fix; the
+power cap would not have helped.**

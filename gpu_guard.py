@@ -52,6 +52,79 @@ def is_oom(exc: BaseException) -> bool:
             or type(exc).__name__ in ("OutOfMemoryError", "AcceleratorError"))
 
 
+def is_allocation_failure(exc: BaseException) -> bool:
+    """Did this fail because the card ran out of room, in any of its shapes?
+
+    `torch.cuda.OutOfMemoryError` is only the tidiest one. A batch measured on
+    Windows never raised it at all: allocations came back as plain
+    RuntimeErrors from cuBLAS and cuDNN, whose workspaces are allocated
+    outside torch's caching allocator and report failure in their own words.
+    Matching only the tidy class is why a whole session recorded `oom_total: 0`
+    while three segments died repeatedly.
+    """
+    if is_oom(exc):
+        return True
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "cudaerrormemoryallocation", "cuda_error_out_of_memory",
+        "cublas_status_alloc_failed", "cudnn_status_alloc_failed",
+        "failed to allocate", "insufficient", "no kernel image",
+    ))
+
+
+def spilled_to_shared() -> bool:
+    """Has CUDA started backing "VRAM" with system RAM?
+
+    On Windows (WDDM) the driver will quietly satisfy allocations out of shared
+    system memory once the card is full, so nothing raises — it just gets
+    slower and slower until something gives up mid-request. The tell is
+    `reserved` exceeding the card's own total, which is physically impossible
+    otherwise. Measured on the batch that produced this: reserved 9008 MB on an
+    8191 MB card, `free_mb: 0`, and every counter still reading zero.
+    """
+    snap = snapshot()
+    total = snap.get("total_mb") or 0
+    return bool(total and snap.get("reserved_mb", 0) > total * 1.02)
+
+
+def reclaim() -> Dict:
+    """Free what can be freed, and say how much came back."""
+    before = snapshot().get("free_mb", 0)
+    free_cuda()
+    after = snapshot().get("free_mb", 0)
+    return {"free_before_mb": before, "free_after_mb": after,
+            "recovered_mb": round(after - before, 1)}
+
+
+def headroom(need_mb: float, floor_mb: float = 0.0) -> Optional[Dict]:
+    """Is there room to start? `None` means yes.
+
+    Called before work begins rather than after it dies. The measured failure
+    took 26-41 s to arrive and returned nothing at all — no status, no body —
+    so the caller could not tell a crash from a hang. Refusing in 2 ms with a
+    `Retry-After` is strictly more useful than that.
+    """
+    snap = snapshot()
+    if snap.get("device") != "cuda":
+        return None
+    free = snap.get("free_mb", 0.0)
+    want = max(float(need_mb), float(floor_mb))
+    if free >= want and not spilled_to_shared():
+        return None
+    got = reclaim()                       # a full cache release may be enough
+    free = got["free_after_mb"]
+    if free >= want and not spilled_to_shared():
+        return None
+    return {
+        "free_mb": free,
+        "needed_mb": round(want, 1),
+        "short_by_mb": round(want - free, 1),
+        "fragmentation_mb": snapshot().get("fragmentation_mb", 0.0),
+        "spilled_to_shared": spilled_to_shared(),
+        "recovered_mb": got["recovered_mb"],
+    }
+
+
 def is_sticky_cuda_error(exc: BaseException) -> bool:
     """A raw `CUDA error: ...` usually poisons the context: every later call
     fails in milliseconds. That is the 0.1s-forever symptom, and retrying it
@@ -191,7 +264,7 @@ class GpuHealth:
             self.consecutive_failures += 1
             self.last_error = f"{type(exc).__name__}: {exc}"[:400]
             self.last_error_at = time.time()
-            if is_oom(exc):
+            if is_allocation_failure(exc):
                 self.oom_total += 1
             if is_sticky_cuda_error(exc) or self.consecutive_failures >= self.fail_threshold:
                 self.ok = False
@@ -273,7 +346,7 @@ def guarded(fn: Callable, *, retries: int = 1, health: Optional[GpuHealth] = Non
             return result
         except BaseException as exc:  # noqa: BLE001 - re-raised below
             del result
-            if not is_oom(exc):
+            if not is_allocation_failure(exc):
                 raise
             if health:
                 health.mark_failed(exc)

@@ -268,6 +268,7 @@ words that were not. Accuracy alone can never be the gate.
 | `413` | input over the **synchronous** limit | resend to `/api/tts/async`, whose limit is far higher — the message names it |
 | `422` | reference rejected (transcript mismatch) | see `detail.message` |
 | `429` | GPU busy past `OMNIVOICE_QUEUE_WAIT` | obey `Retry-After` |
+| `503` | `insufficient_vram` — refused before starting, in ~0.16 s | obey `Retry-After`; if `spilled_to_shared` is true the server needs a restart, not a retry |
 | `500` | generation failed | |
 | `503` | GPU unavailable / not ready | obey `Retry-After`; check `/api/ready` |
 
@@ -407,6 +408,117 @@ Turn checking off with `OMNIVOICE_VERIFY=0` if you would rather audit the whole
 batch afterwards with `tools/audit_batch.py`; responses then carry
 `X-Verified: false`.
 
+## 5c. Why was this clip slow, and what happens when the GPU is full
+
+Two things a caller could not previously find out: **why** a clip took as long
+as it did, and **whether the server had room** before it started.
+
+### `X-RTF-Reason` and the `rtf_reason` block
+
+`X-RTF` says how much. It never said why — and the two expensive causes look
+identical from outside. A card so short of memory that everything crawls and a
+clip whose chunks were quietly rebuilt five times both report `0.30`. One is
+cured by restarting the box, the other by fixing that voice's reference.
+Measured on one real batch: 396 words in 27.8 s and 394 words in 50.1 s, same
+voice, same settings, two minutes apart.
+
+Every response now carries the answer. On `/api/tts`:
+
+```
+X-RTF: 0.431
+X-RTF-Reason: higher than usual: 2 of 23 chunk(s) had to be generated again
+              (dropped words x2), costing 3.3s; verification took 49.6s
+              against 36.4s of generation
+X-Gen-Sec: 36.41      X-Verify-Sec: 49.64     X-Regen-Sec: 3.33
+X-Chunks: 23          X-Chunks-Regenerated: 2  X-VRAM-Free-MB: 3448
+```
+
+A clip that was ordinary says so, and says nothing else:
+
+```
+X-RTF: 0.170      X-RTF-Reason: normal
+```
+
+`POST /api/v2/tts` returns the same thing structured:
+
+```json
+"rtf": 0.431,
+"rtf_reason": {
+  "rtf": 0.431, "normal": false, "normal_up_to": 0.26,
+  "summary": "higher than usual: 2 of 23 chunk(s) had to be generated again …",
+  "causes": ["2 of 23 chunk(s) had to be generated again (dropped words x2), costing 3.3s",
+             "verification took 49.6s against 36.4s of generation"]
+},
+"timing": {"normalize_s": 0.003, "generate_s": 36.411,
+           "verify_s": 49.643, "join_s": 0.066, "total_s": 86.818},
+"chunks": {"total": 23, "regenerated": 2, "which": [14, 22],
+           "regeneration_reasons": {"dropped_words": 2}, "regenerate_s": 3.329},
+"vram_at_start_mb": 3448.0
+```
+
+The causes it will name: chunks regenerated (with the reason and which ones),
+verification outweighing generation, the card being short of memory when the
+clip started, VRAM having spilled into system memory, a clip too short for the
+fixed per-request cost to disappear into, and a voice prompt built from scratch.
+`OMNIVOICE_RTF_NORMAL_MAX` (default `0.26`) sets where "normal" ends.
+
+### `503 insufficient_vram` — refused in milliseconds, not dead in 35 seconds
+
+A measured batch ran the card down to `free_mb: 0` with `reserved` at 9008 MB
+on an 8191 MB card — CUDA had spilled into system RAM — and from then on every
+request needing real memory **died 26-41 s in and returned nothing at all**: no
+status code, no body, no log line, and every counter still reading zero. A
+caller could not tell a crash from a hang.
+
+Requests are now checked for headroom before any GPU work begins:
+
+```json
+HTTP 503   Retry-After: 30
+{"detail": {"error": "insufficient_vram",
+            "message": "the GPU has 412 MB free and this clip needs about 940 MB. Nothing was generated; retry shortly.",
+            "free_mb": 412.0, "needed_mb": 940.0, "short_by_mb": 528.0,
+            "fragmentation_mb": 3440.0, "spilled_to_shared": true,
+            "recovered_mb": 0.0}}
+```
+
+Measured: **0.16 s to refuse.** A cache release is attempted first, so this only
+fires when the memory genuinely is not there. `spilled_to_shared: true` means
+the server needs restarting rather than retrying — it is the one condition a
+`Retry-After` cannot fix. Counted as `vram_refusals` in `/api/metrics`.
+
+Tune the floor with `OMNIVOICE_MIN_FREE_MB` (default `700`).
+
+### `/api/ready` now needs headroom as well as a working model
+
+It used to answer `ok` on the strength of the self-test alone, and in that
+batch it did so for an entire session while `free_mb` was 0 and every
+substantial request was dying — because four words still generate fine on a
+card with nothing left. Both conditions must now hold:
+
+```json
+HTTP 503
+{"status": "degraded", "ready": false,
+ "reason": "only 412 MB of VRAM free (need 700 MB to start work)"}
+```
+
+The self-test itself also generates ~60 words rather than four, for the same
+reason: a probe that does less than a real request answers a question nobody
+asked. Override it with `OMNIVOICE_SELFTEST_TEXT`.
+
+### Per-voice regeneration rate
+
+`/api/metrics` gains `per_voice`. A global regeneration count says the model is
+struggling; a per-voice one says **which reference** is struggling, which is the
+half a customer can act on:
+
+```json
+"per_voice": {"narrator_a": {"clips": 40, "chunks": 210,
+                             "regenerated": 3, "regeneration_rate": 0.0143}}
+```
+
+A voice well above the others has a problem in its reference clip, not in the
+scripts it is being given.
+
 ## 6. Running it
 
 The API starts with the app — same process, same GPU, own port.
@@ -422,6 +534,8 @@ set OMNIVOICE_VERIFY=0                REM ship without checking (see 5b)
 set OMNIVOICE_ASR_BATCH=12            REM verifier windows read at once
 set OMNIVOICE_ASR_DEVICE=cpu          REM move Whisper off the GPU entirely
 set OMNIVOICE_ASR_BACKEND=faster      REM CTranslate2 verifier: -1.6 GB VRAM
+set OMNIVOICE_MIN_FREE_MB=700         REM refuse below this much free VRAM
+set OMNIVOICE_RTF_NORMAL_MAX=0.26     REM above this, a clip explains itself
 ```
 
 `OMNIVOICE_ASR_BATCH` is the one worth knowing about. The verifier reads its
