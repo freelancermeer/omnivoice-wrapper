@@ -24,8 +24,20 @@ REM set OMNIVOICE_AUTH=admin:mypassword
 REM ---- API key bhi lagayein agar API bahar khul rahi hai ----
 REM set OMNIVOICE_API_KEY=change-me
 
-echo Starting with PUBLIC share link...
-echo Console me jo https://....gradio.live URL aaye wo share karein.
+if not defined GRADIO_SERVER_PORT set GRADIO_SERVER_PORT=7860
+if not defined OMNIVOICE_API_PORT set OMNIVOICE_API_PORT=8001
+
+echo ============================================================
+echo   OmniVoice Voiceover Studio  (PUBLIC share link)
+echo ------------------------------------------------------------
+echo   UI   (local)    http://127.0.0.1:%GRADIO_SERVER_PORT%
+echo   API  (local)    http://127.0.0.1:%OMNIVOICE_API_PORT%
+echo   API  docs       http://127.0.0.1:%OMNIVOICE_API_PORT%/api/docs
+echo ------------------------------------------------------------
+echo   Console me jo https://....gradio.live URL aaye wo share karein.
+echo   NOTE: sirf UI share hoti hai. API public NAHI hoti - wo is
+echo   machine par hi rehti hai.
+echo ============================================================
 echo.
 "%~dp0venv\Scripts\python.exe" "%~dp0app.py"
 echo.

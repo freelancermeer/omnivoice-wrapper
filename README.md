@@ -117,8 +117,13 @@ models are local, and the `.bat` files set `HF_HUB_OFFLINE=1`.
 
 ## 🔌 Local REST API
 
-Port **8001**, same process, shared model and queue. Full spec in
-**[LOCAL_API.md](LOCAL_API.md)**; interactive docs at `http://<pc-ip>:8001/api/docs`.
+Port **8001**, same process, shared model and queue. Open
+`http://<pc-ip>:8001/` in a browser for a self-describing index — status,
+endpoints, and a ready-to-paste `curl` using one of your own voices. Full spec
+in **[LOCAL_API.md](LOCAL_API.md)**; interactive docs at `/api/docs`.
+
+`run.bat` prints both URLs before the model starts loading, so the address is on
+screen from the first second rather than after a twenty-second wait.
 
 ```bash
 # text + voice clip -> mp3   (this contract is frozen and will not change)

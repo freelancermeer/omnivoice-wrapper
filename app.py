@@ -2787,6 +2787,8 @@ import hashlib
 from contextlib import contextmanager
 
 API_PORT = int(os.environ.get("OMNIVOICE_API_PORT", "8001"))
+# Only so the API landing page can point a lost visitor at the UI.
+UI_PORT_HINT = os.environ.get("GRADIO_SERVER_PORT", "7860")
 STRICT_PARAMS = _env_flag("OMNIVOICE_STRICT_PARAMS", "0")
 HEALTH_STRICT = _env_flag("OMNIVOICE_HEALTH_STRICT")
 IDEM_TTL_S = float(os.environ.get("OMNIVOICE_IDEMPOTENCY_TTL", str(24 * 3600)))
@@ -3625,6 +3627,123 @@ def _build_api():
         if not os.path.exists(path):
             raise HTTPException(status_code=404, detail="file not found")
         return FileResponse(path, filename=safe)
+
+
+    # ---- landing page ----------------------------------------------------
+    _ENDPOINTS = [
+        ("POST", "/api/tts", "text + voice in, audio bytes out. The frozen contract."),
+        ("POST", "/api/v2/tts", "same inputs, JSON out: timing, chunks, warnings, audio inline."),
+        ("POST", "/api/tts/async", "returns a job_id in ~10 ms; poll /api/jobs/{id}."),
+        ("GET", "/api/jobs/{id}", "job status, then /api/jobs/{id}/download."),
+        ("POST", "/api/voices", "register a reusable voice from a 6-10 s clip."),
+        ("GET", "/api/voices", "list registered voices."),
+        ("DELETE", "/api/voices/{id}", "remove one."),
+        ("POST", "/api/transcribe", "transcribe a clip; pass text= to diff it."),
+        ("GET", "/api/live", "process is up. Cheap."),
+        ("GET", "/api/ready", "up AND has room to work. Point monitoring here."),
+        ("GET", "/api/health", "version, VRAM, voices, error counters."),
+        ("GET", "/api/metrics", "counters, RTF, per-voice regeneration rate."),
+        ("GET", "/api/docs", "interactive OpenAPI docs."),
+    ]
+
+    @api.get("/", include_in_schema=False)
+    @api.get("/api", include_in_schema=False)
+    def api_index(request: Request):
+        """Something readable at the address people actually type.
+
+        This used to be `{"detail":"Not Found"}`, which tells a visitor nothing
+        — not that they are on the right port, not what lives here, not where
+        the docs are. Anyone opening the API port is either checking it is
+        alive or looking for the endpoint list, so give them both.
+        """
+        host = request.url.hostname or "127.0.0.1"
+        base = f"http://{host}:{API_PORT}"
+        snap = gpu_guard.snapshot()
+        ready = READY.as_dict()
+        try:
+            voices = list_voice_names()
+        except Exception:  # noqa: BLE001
+            voices = []
+
+        ok = bool(ready.get("ready")) and HEALTH.ok
+        rows = "".join(
+            f'<tr><td class="m {m.lower()}">{m}</td>'
+            f'<td class="p"><a href="{html_mod.escape(p.split("{")[0])}">'
+            f'{html_mod.escape(p)}</a></td>'
+            f'<td class="d">{html_mod.escape(d)}</td></tr>'
+            for m, p, d in _ENDPOINTS)
+
+        vram = ""
+        if snap.get("device") == "cuda":
+            vram = (f"{snap.get('name','GPU')} &middot; "
+                    f"{snap.get('free_mb',0):.0f} MB free of "
+                    f"{snap.get('total_mb',0):.0f}")
+
+        body = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OmniVoice API &middot; {API_PORT}</title><style>
+:root{{color-scheme:light dark}}
+body{{margin:0;padding:2.2rem 1.2rem;font:15px/1.6 ui-sans-serif,system-ui,
+ -apple-system,"Segoe UI",Roboto,sans-serif;background:#fbfbfc;color:#16181d}}
+main{{max-width:56rem;margin:0 auto}}
+h1{{font-size:1.45rem;margin:0 0 .2rem;letter-spacing:-.01em}}
+.sub{{color:#5b6270;margin:0 0 1.6rem}}
+.bar{{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:0 0 1.6rem}}
+.pill{{display:inline-flex;align-items:center;gap:.4rem;padding:.3rem .7rem;
+ border-radius:999px;font-size:.82rem;font-weight:600}}
+.up{{background:#e7f6ec;color:#12683a}} .down{{background:#fdeaea;color:#a3242b}}
+.dot{{width:.5rem;height:.5rem;border-radius:50%;background:currentColor}}
+.meta{{color:#5b6270;font-size:.85rem}}
+.url{{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+ background:#eef0f4;padding:.2rem .45rem;border-radius:5px;font-size:.9em}}
+table{{width:100%;border-collapse:collapse;margin:.4rem 0 1.6rem;
+ font-size:.9rem;table-layout:fixed}}
+td{{padding:.42rem .5rem;border-top:1px solid #e6e8ee;vertical-align:top}}
+td.m{{width:4.6rem;font-weight:700;font-size:.74rem;padding-top:.6rem}}
+td.p{{width:15rem}} td.d{{color:#5b6270}}
+.get{{color:#1d6fd0}} .post{{color:#12683a}} .delete{{color:#a3242b}}
+a{{color:#1d6fd0;text-decoration:none}} a:hover{{text-decoration:underline}}
+pre{{background:#16181d;color:#e6e8ee;padding:.9rem 1rem;border-radius:8px;
+ overflow-x:auto;font-size:.83rem;line-height:1.5}}
+h2{{font-size:.95rem;margin:1.8rem 0 .3rem}}
+footer{{margin-top:2rem;color:#8a909c;font-size:.82rem}}
+@media(prefers-color-scheme:dark){{
+ body{{background:#0f1115;color:#e6e8ee}} .sub,.meta,td.d{{color:#98a0ae}}
+ td{{border-top-color:#252932}} .url{{background:#1b1f27}}
+ .up{{background:#123021;color:#5ed99a}} .down{{background:#3a1618;color:#ff8a90}}
+ footer{{color:#6b7280}}}}
+</style></head><body><main>
+<h1>OmniVoice Local API</h1>
+<p class="sub">Text to speech with voice cloning, on this machine.</p>
+<div class="bar">
+ <span class="pill {'up' if ok else 'down'}"><span class="dot"></span>
+  {'ready' if ok else html_mod.escape(str(ready.get('detail', 'not ready'))[:60])}</span>
+ <span class="meta">v{API_VERSION} &middot; omnivoice {OMNIVOICE_VERSION}
+  &middot; {len(voices)} voice(s){' &middot; ' + vram if vram else ''}</span>
+</div>
+
+<p>Base URL <span class="url">{html_mod.escape(base)}</span> &middot;
+ the web UI is on <a href="http://{html_mod.escape(host)}:{UI_PORT_HINT}">port
+ {UI_PORT_HINT}</a>, not this one.</p>
+
+<h2>Endpoints</h2>
+<table>{rows}</table>
+
+<h2>Try it</h2>
+<pre>curl -X POST {html_mod.escape(base)}/api/tts \
+  -F "text=Hello from the API" \
+  -F "voice_id={html_mod.escape(voices[0]) if voices else 'YOUR_VOICE'}" \
+  -F "format=mp3" -o out.mp3</pre>
+<p class="meta">No registered voice yet? Upload a 6-10 s clip:
+ <span class="url">curl -X POST {html_mod.escape(base)}/api/voices
+ -F "name=narrator" -F "voice=@clip.wav"</span></p>
+
+<footer>Full reference in LOCAL_API.md &middot;
+ <a href="/api/docs">interactive docs</a> &middot;
+ <a href="/api/health">health</a> &middot;
+ <a href="/api/metrics">metrics</a></footer>
+</main></body></html>"""
+        return Response(content=body, media_type="text/html; charset=utf-8")
 
     return api
 

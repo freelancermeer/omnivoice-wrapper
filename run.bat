@@ -52,8 +52,25 @@ REM set OMNIVOICE_MIN_FREE_MB=700
 REM  Is se upar RTF ho to clip khud wajah batayegi. Default 0.26.
 REM set OMNIVOICE_RTF_NORMAL_MAX=0.26
 
-echo Starting OmniVoice Voiceover Studio...
-echo (pehli baar model load me ~10-20 sec lagte hain)
+REM Ports, taake window me hamesha saamne rahen. Agar upar GRADIO_SERVER_PORT
+REM ya OMNIVOICE_API_PORT badla ho to yahan bhi wohi likhein.
+if not defined GRADIO_SERVER_PORT set GRADIO_SERVER_PORT=7860
+if not defined OMNIVOICE_API_PORT set OMNIVOICE_API_PORT=8001
+
+echo ============================================================
+echo   OmniVoice Voiceover Studio
+echo ------------------------------------------------------------
+echo   UI   (browser)  http://127.0.0.1:%GRADIO_SERVER_PORT%
+echo   API  (base)     http://127.0.0.1:%OMNIVOICE_API_PORT%
+echo   API  docs       http://127.0.0.1:%OMNIVOICE_API_PORT%/api/docs
+echo   API  ready      http://127.0.0.1:%OMNIVOICE_API_PORT%/api/ready
+echo ------------------------------------------------------------
+echo   Voice banane aur render karne ke liye UI kholein.
+echo   Apne code se bhejna ho to API base URL istemal karein.
+echo ============================================================
+echo.
+echo Starting... (pehli baar model load me ~10-20 sec lagte hain)
+echo LAN ka pata neeche app khud print karega.
 echo.
 "%~dp0venv\Scripts\python.exe" "%~dp0app.py"
 

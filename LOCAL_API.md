@@ -8,6 +8,11 @@ same engine and default settings as the Voiceover Studio UI.
 > the UI on its **own port `8001`** (UI stays on `7860`), sharing the loaded model,
 > GPU lock, and job queue. Interactive docs: **`http://<pc-ip>:8001/api/docs`**.
 >
+> **Open `http://<pc-ip>:8001/` in a browser** and the API describes itself:
+> status, version, VRAM, every endpoint, and a `curl` example filled in with a
+> voice you have actually registered. It used to answer `{"detail":"Not Found"}`,
+> which told a visitor nothing — not even that they were on the right port.
+>
 > **Base URL:** `http://<pc-ip>:8001` (not 7860). Change with `OMNIVOICE_API_PORT`;
 > disable the API with `OMNIVOICE_API=0`. Auth is **open** by default — set
 > `OMNIVOICE_API_KEY=<key>` to require an `X-API-Key` header.
