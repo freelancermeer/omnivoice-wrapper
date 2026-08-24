@@ -1089,3 +1089,56 @@ Five of the seven reported pairs already passed. The two that did not:
 Guarded and tested: `ninety million` → `90 billion`, `not` → `now`,
 `nothing` → `something`, `first` → `third`, a dropped `dollars`, and the
 repeated-clause collapse are all still caught.
+
+
+---
+
+# Verification is now off by default
+
+A deliberate reversal, recorded because reversing it again should be an
+informed decision rather than a rediscovery.
+
+Verification exists because a production batch shipped **12 silently dropped
+words**. It found them, and it still would. What changed is the arithmetic
+around it, measured on a later 19-clip / 214-chunk batch:
+
+* it cost **26 % of the run**;
+* every "defect" it reported was the transcriber spelling the same sound its
+  own way — `advisers`/`advisors`, `behavior`/`behaviour`, `lockup`/`lock up`;
+* **not one genuinely dropped word in 19 clips**;
+* and each of those bought a re-generation *and* a re-verification of the whole
+  clip. Clips with one regenerated chunk verified at 1.07 s per chunk against
+  0.31 s for clips with none.
+
+So `OMNIVOICE_VERIFY` and `OMNIVOICE_VERIFY_RETRIES` both default to `0`.
+Measured here on a ten-clip batch after the change: **24 s against 27 s, best
+RTF 0.143 against 0.174**, and `tools/audit_batch.py` on the same output still
+reported **0 added, 0 dropped, 10/10 clean**. 34 acceptance checks pass; the
+one that no longer runs is the per-clip verification check itself.
+
+## What still protects a clip with checking off
+
+| | |
+|---|---|
+| **Reference bleed** — the 218-word bug | prevented at source: references can no longer end mid-word, and a `ref_text` that does not match its audio is refused with `422` at registration |
+| **Dropped words** | found by `tools/audit_batch.py` after the run, with the same `verify.word_diff` — later, but before the customer |
+| **Loudness, chunk seams, tail padding** | unaffected; none of them ever depended on the verifier |
+| **A dead or full GPU** | unaffected: the headroom check, the 503, and `/api/ready` are all independent of verification |
+
+The honest trade: a bad chunk is no longer repaired *during* the run. You learn
+which clips are bad and re-render those. That is a decision about when you find
+out, not whether.
+
+Turn it back on for a batch you are unsure of:
+
+```powershell
+set OMNIVOICE_VERIFY=1
+set OMNIVOICE_VERIFY_RETRIES=1    REM and repair during the run
+```
+
+One thing worth knowing before deciding: the reason that batch saw nothing real
+was that every finding was a homophone, and homophones no longer count as
+defects. The false-alarm classes fixed the same day — digits read as words,
+clock times, inferred currency symbols, bare plurals, sound-alike names and
+spacing variants — were what made checking expensive. Its cost profile is not
+the one that was measured.

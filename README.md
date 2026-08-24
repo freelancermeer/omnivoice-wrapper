@@ -6,10 +6,18 @@ cloning** and **voice design**. Built with Gradio, it adds a production-style
 **project queue**: pick a voice, add scripts, render them one at a time, every
 clip auto-saved to a folder.
 
-Every clip is **transcribed back and compared against your script** before it is
-returned, **levelled to the same loudness** as every other clip, and generated
-from a reference that was **cut at a natural pause rather than a stopwatch**.
-Those three things are why this exists rather than a bare `model.generate()`.
+Every clip is **levelled to the same loudness** as every other clip, generated
+from a reference that was **cut at a natural pause rather than a stopwatch**,
+and can be **transcribed back and compared against your script** — either per
+clip while rendering, or across a whole batch afterwards with
+`tools/audit_batch.py`. Those three things are why this exists rather than a
+bare `model.generate()`.
+
+> **Checking is off by default** (`OMNIVOICE_VERIFY=1` turns it on). It caught
+> real defects and still would, but on a measured 19-clip batch it cost 26 % of
+> the run and every "defect" it reported was the transcriber spelling the same
+> sound its own way, with not one genuinely dropped word. The batch audit finds
+> the same things afterwards for nothing.
 
 > **Note:** the model weights (`Model/`, ~3.3 GB) and the Python `venv/` are **not**
 > in this repo (see `.gitignore`). Follow the setup below to get them on a new PC.
@@ -174,7 +182,8 @@ time actually goes, and what each lever costs:
 |---|---|---|
 | **Quality steps** | `16` is the default and the best value. `8–10` is noticeably faster | below ~10, quality starts to show |
 | **`OMNIVOICE_VERIFY_MODE=fast`** (default) | one ASR pass over the finished clip instead of one per chunk — a five-chunk job drops from 5 extra passes to **1** | drilling into chunks only happens when something is actually wrong |
-| `OMNIVOICE_VERIFY=0` | removes checking entirely | you go back to shipping bad clips silently — the thing this exists to prevent |
+| **`OMNIVOICE_VERIFY`** | now **`0` by default**. Per-clip checking off; audit the batch afterwards with `tools/audit_batch.py` | measured 27 s → 24 s on a ten-clip batch, best RTF 0.174 → 0.143. Set `=1` for a batch you are unsure of |
+| **`OMNIVOICE_VERIFY_RETRIES`** | now **`0` by default**. Checking, when on, warns but never re-rolls a chunk | a re-generation costs a full clip **and** a re-verification of the whole clip — clips with one regenerated chunk verified 3.5x slower than clips with none |
 | *(automatic)* | a substitution the transcriber probably misheard no longer triggers a re-generation | none — it is reported as a pronunciation note instead |
 | `OMNIVOICE_MAX_CHARS` | now `200`. Fewer, longer chunks mean fewer fixed per-call overheads **and** a steadier voice — upstream reports speaker switching on short generations | too large and long-text degeneration returns (upstream #144) |
 | `OMNIVOICE_NUM_STEP` | the one parameter that reliably trades quality for speed | below ~10 it shows |

@@ -404,9 +404,18 @@ regenerated during the run and the caller never sees it. With it off you learn
 which clips are bad and re-render them yourself. On this server the recommended
 setting is **on**.
 
-Turn checking off with `OMNIVOICE_VERIFY=0` if you would rather audit the whole
-batch afterwards with `tools/audit_batch.py`; responses then carry
-`X-Verified: false`.
+**Checking is OFF by default.** `X-Verified` reads `false`, no `diff` block is
+returned, and nothing is re-rolled. Audit the batch afterwards with
+`tools/audit_batch.py`, which finds the same defects at no per-clip cost.
+
+Turn it on per server with `OMNIVOICE_VERIFY=1`. Measured on a ten-clip batch:
+27 s checked against 24 s unchecked, best RTF 0.174 against 0.143.
+
+`OMNIVOICE_VERIFY_RETRIES` is also `0` by default, so checking — when you do
+turn it on — warns without re-rolling. Set it to `1` and a chunk that came out
+wrong is regenerated during the run and the caller never sees it, at the cost
+of re-verifying the whole clip: clips with one regenerated chunk verified 3.5x
+slower per chunk than clips with none.
 
 ## 5c. Why was this clip slow, and what happens when the GPU is full
 
@@ -538,7 +547,8 @@ set OMNIVOICE_API_PORT=9000           REM different port
 set OMNIVOICE_API_KEY=change-me       REM require X-API-Key
 set OMNIVOICE_API_KEYS=k1:acme,k2:globex   REM per-customer voice isolation
 set OMNIVOICE_MAX_CONCURRENCY=1       REM 1 on an 8 GB card
-set OMNIVOICE_VERIFY=0                REM ship without checking (see 5b)
+set OMNIVOICE_VERIFY=1                REM per-clip checking (default: 0, off)
+set OMNIVOICE_VERIFY_RETRIES=1        REM re-roll a bad chunk (default: 0)
 set OMNIVOICE_ASR_BATCH=12            REM verifier windows read at once
 set OMNIVOICE_ASR_DEVICE=cpu          REM move Whisper off the GPU entirely
 set OMNIVOICE_ASR_BACKEND=faster      REM CTranslate2 verifier: -1.6 GB VRAM

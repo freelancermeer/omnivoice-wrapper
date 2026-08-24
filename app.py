@@ -228,9 +228,30 @@ REQUIRE_CONSENT = _env_flag("OMNIVOICE_REQUIRE_CONSENT", "0")
 PREWARM_VOICES = _env_flag("OMNIVOICE_PREWARM_VOICES", "0")
 
 # --- verification ---------------------------------------------------------
-VERIFY = _env_flag("OMNIVOICE_VERIFY")
+# OFF by default, deliberately, and this is a reversal worth explaining.
+#
+# Verification exists because a production batch shipped 12 silently dropped
+# words. It found them, and it still would. What changed is the arithmetic
+# around it. Measured on a 19-clip batch: verification was 26 % of the run, and
+# every "defect" it reported was the transcriber spelling the same sound its own
+# way -- advisers/advisors, behavior/behaviour, lockup/lock up -- with **not one
+# genuinely dropped word**. Each of those bought a re-generation *and* a
+# re-verification of the whole clip, which is where RTF was going: clips with a
+# regenerated chunk verified 3.5x slower than clips without one.
+#
+# So the checking is now opt-in and the batch audit is the default answer.
+# `tools/audit_batch.py` finds the same defects after a run, at no per-clip
+# cost, and the reference bleed that per-clip ASR used to catch is now
+# prevented at source -- a mismatched `ref_text` is refused with 422 at
+# registration, and references can no longer end mid-word.
+#
+# Turn it back on for a batch you are unsure of:  set OMNIVOICE_VERIFY=1
+VERIFY = _env_flag("OMNIVOICE_VERIFY", "0")
 VERIFY_BUDGET_S = float(os.environ.get("OMNIVOICE_VERIFY_BUDGET", "45"))
-VERIFY_RETRIES = int(os.environ.get("OMNIVOICE_VERIFY_RETRIES", "1"))
+# Verify and warn, never re-roll. A re-generation costs a full clip and is
+# judged by the same fallible transcriber, so it is opt-in even when checking
+# is on: the warning is the useful part, the retry mostly was not.
+VERIFY_RETRIES = int(os.environ.get("OMNIVOICE_VERIFY_RETRIES", "0"))
 # "fast"   - one ASR pass over the finished clip; drill into chunks only when
 #            that pass finds something wrong. A clean job is the common case,
 #            and this is what keeps RTF close to unverified.
@@ -3697,7 +3718,8 @@ if __name__ == "__main__":
             print(f"  omnivoice {OMNIVOICE_VERSION} · features: {_feat}"
                   + ("   <- OUTDATED, run pip install -r requirements.txt"
                      if OMNIVOICE_OUTDATED else ""))
-            print(f"  verify={'on' if VERIFY else 'off'} · "
+            print(f"  verify={'on' if VERIFY else 'OFF (audit with '
+                  f'tools/audit_batch.py)'} · "
                   f"normalize={NORMALIZE_LEVEL} · "
                   f"loudness={'on' if NORMALIZE_OUTPUT else 'off'} "
                   f"({OUT_TARGET_LUFS:.0f} LUFS) · concurrency={MAX_CONCURRENCY}"

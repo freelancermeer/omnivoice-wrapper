@@ -22,9 +22,14 @@ REM ---- Optional tweaks (line ke aage REM hata kar enable karein) ----
 REM set OMNIVOICE_NUM_STEP=16
 REM set GRADIO_SERVER_PORT=7860
 REM set OMNIVOICE_OPEN_BROWSER=0
-REM  Har clip ko transcribe kar ke script se match karta hai (default: on).
-REM  Band karne ke liye:
-REM set OMNIVOICE_VERIFY=0
+REM  Har clip ko transcribe kar ke script se match karna ab default OFF hai.
+REM  Batch ke baad audit karein:  tools\audit_batch.py manifest.json
+REM  Kisi batch pe shak ho to per-clip checking wapas on:
+REM set OMNIVOICE_VERIFY=1
+REM  Checking on ho to bhi chunk dobara na banaye (sirf warning de) - default 0.
+REM  1 karne se ek kharab chunk run ke doran khud theek hota hai, magar wo
+REM  poori clip dobara verify karwata hai.
+REM set OMNIVOICE_VERIFY_RETRIES=0
 REM  Ek waqt me kitni generations (8 GB card par 1 hi rakhein):
 REM set OMNIVOICE_MAX_CONCURRENCY=1
 REM  Har clip ki loudness (default -20 LUFS):
