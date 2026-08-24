@@ -336,19 +336,39 @@ def test_join_gives_even_gaps_and_no_hard_edges():
     assert abs(audio_fx.trailing_silence_sec(y, SR) - 0.30) < 0.15
 
 
-def test_join_reports_truncation_but_not_on_every_clip():
-    """The check is judged on the raw last chunk. Once trailing silence has
-    been stripped every clip ends in speech, so checking the joined audio would
-    flag all of them — and a detector that fires on every good clip is worse
-    than no detector at all."""
+def test_join_does_not_judge_truncation_at_all():
+    """It used to, and the reasoning was wrong in a way that took a batch to see.
+
+    The old check ran on the raw last chunk, on the argument that stripping
+    trailing silence leaves every clip ending in speech so the joined audio
+    would flag all of them. That overlooked the tail padding this same function
+    appends: the joined clip ends in 0.3 s of silence, so it flags *none* of
+    them. Meanwhile the raw last chunk ends on speech whenever the model did
+    not leave its own gap, which is common and not a defect — 11 of 63 clips
+    in a clean batch, every one measuring -91 dB over its final 0.25 s.
+
+    So `join_chunks` reports what it saw and leaves the verdict to whoever
+    holds the delivered audio.
+    """
     cut_off = speech(sentence(5))[: -int(0.05 * SR)]
-    _y, info = audio_fx.join_chunks([cut_off], SR, tail_pad_sec=0.30)
-    assert info["ends_abruptly"] is True, info
+    y, info = audio_fx.join_chunks([cut_off], SR, tail_pad_sec=0.30)
+    assert "ends_abruptly" not in info, "the misleading verdict is gone"
+    assert info["last_chunk_ends_loud"] is True, info
+    assert not audio_fx.ends_abruptly(y, SR), "padded output must not warn"
 
     finished = [speech(sentence(4) + [("s", 0.5)]),
                 speech(sentence(4) + [("s", 0.5)])]
-    _y2, info2 = audio_fx.join_chunks(finished, SR, tail_pad_sec=0.30)
-    assert info2["ends_abruptly"] is False, "false alarm on a finished clip"
+    y2, info2 = audio_fx.join_chunks(finished, SR, tail_pad_sec=0.30)
+    assert info2["last_chunk_ends_loud"] is False
+    assert not audio_fx.ends_abruptly(y2, SR)
+
+
+def test_a_clip_delivered_without_padding_can_still_warn():
+    """The warning is not dead — with no tail pad, a cut-off clip still reads
+    as cut off, which is the only case where it should fire."""
+    cut_off = speech(sentence(5))[: -int(0.05 * SR)]
+    y, _info = audio_fx.join_chunks([cut_off], SR, tail_pad_sec=0.0)
+    assert audio_fx.ends_abruptly(y, SR)
 
 
 def test_join_does_not_eat_a_soft_final_consonant():
@@ -369,3 +389,41 @@ def test_join_of_a_single_chunk_is_still_padded():
 def test_join_of_nothing_is_survivable():
     y, info = audio_fx.join_chunks([], SR)
     assert len(y) == 0 and info["chunks"] == 0
+
+
+# --- the truncation warning, on the audio the caller actually receives -----
+# It used to be judged on the last chunk as the model made it, which is
+# upstream of the 300 ms of silence join_chunks appends. A clean 63-clip batch
+# flagged 11 clips, and all eleven measured -91 dB over their final 0.25 s.
+
+def _speech(sr, seconds, freq=140.0, amp=0.3):
+    t = np.arange(int(seconds * sr)) / sr
+    return (amp * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+
+def test_a_clip_that_ends_in_silence_does_not_warn():
+    sr = 24000
+    clip = np.concatenate([_speech(sr, 2.0), np.zeros(int(0.3 * sr), np.float32)])
+    assert not audio_fx.ends_abruptly(clip, sr)
+
+
+def test_a_clip_cut_off_mid_word_does_warn():
+    sr = 24000
+    assert audio_fx.ends_abruptly(_speech(sr, 2.0), sr)
+
+
+def test_join_chunks_delivers_a_clip_that_does_not_look_truncated():
+    """The real regression: the model's last chunk ends on speech, and the
+    joined output must still not read as cut short, because padding was added."""
+    sr = 24000
+    parts = [_speech(sr, 1.0), _speech(sr, 1.0)]      # both end at full volume
+    out, info = audio_fx.join_chunks(parts, sr, tail_pad_sec=0.30)
+    assert info["last_chunk_ends_loud"], "fixture should end loud before padding"
+    assert not audio_fx.ends_abruptly(out, sr), "delivered clip must not warn"
+
+
+def test_join_chunks_no_longer_reports_a_truncation_verdict():
+    """The key that produced the false warning is gone, so nothing can read it."""
+    sr = 24000
+    _out, info = audio_fx.join_chunks([_speech(sr, 1.0)], sr, tail_pad_sec=0.30)
+    assert "ends_abruptly" not in info

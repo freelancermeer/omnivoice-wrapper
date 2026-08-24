@@ -464,10 +464,18 @@ CATASTROPHIC_LOW, CATASTROPHIC_HIGH = 50.0, 280.0
 # "a 210 wpm voice that drifted to 175" as the case it catches - but 175/210 is
 # 0.83, comfortably inside 0.75. Tightening to 0.85 to catch that example would
 # fire constantly: in the measured batch a single voice ranged 160-203 wpm
-# (about +/-12%) on ordinary clips. So 0.75-1.30 stays the default, and a 17%
-# drift is treated as within a voice's normal range rather than as a warning
-# nobody would trust after the first fifty false alarms.
-RATE_LOW, RATE_HIGH = 0.75, 1.30
+# (about +/-12%) on ordinary clips. So a 17% drift is treated as within a
+# voice's normal range rather than as a warning nobody would trust after the
+# first fifty false alarms.
+#
+# The ceiling moved 1.30 -> 1.40 on later evidence. A clean 63-clip batch warned
+# on three clips at 194, 195 and 204 wpm against a 147 wpm baseline - 1.32 to
+# 1.39 - and all three were ordinary. (The report that raised it suggested
+# "+/-25%", which would be 1.25 and *tighter* than what was already there; its
+# own measurements are what argue for 1.40.) The floor stays at 0.75: a voice
+# slowing right down is a better signal of something wrong than one speeding up
+# a little, and nothing in the measured data argues for moving it.
+RATE_LOW, RATE_HIGH = 0.75, 1.40
 
 
 def rate_warning(measured: float, baseline: Optional[float],

@@ -522,6 +522,22 @@ The self-test itself also generates ~60 words rather than four, for the same
 reason: a probe that does less than a real request answers a question nobody
 asked. Override it with `OMNIVOICE_SELFTEST_TEXT`.
 
+### What `X-OmniVoice-Warning` will and will not say
+
+The header is only worth reading if it is right, so two checks that were firing
+on healthy clips no longer do.
+
+**"the clip ends at full volume"** is now measured on the audio you receive,
+after joining, padding and loudness normalization. It used to be judged on the
+model's raw last chunk, upstream of the 300 ms of silence this pipeline appends
+— which flagged 11 of 63 clips that all measured −91 dB over their final
+0.25 s. A clip genuinely cut off mid-word still warns.
+
+**Speaking rate** is compared against the voice's own baseline, and the ceiling
+is now `1.40 x baseline` (from `1.30`). A clean batch warned at 194, 195 and
+204 wpm against a 147 wpm baseline, all ordinary. Tune with
+`OMNIVOICE_RATE_LOW` / `OMNIVOICE_RATE_HIGH`.
+
 ### Per-voice regeneration rate
 
 `/api/metrics` gains `per_voice`. A global regeneration count says the model is

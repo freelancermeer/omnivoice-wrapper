@@ -1142,3 +1142,78 @@ defects. The false-alarm classes fixed the same day — digits read as words,
 clock times, inferred currency symbols, bare plurals, sound-alike names and
 spacing variants — were what made checking expensive. Its cost profile is not
 the one that was measured.
+
+
+---
+
+# The truncation warning was measuring the wrong audio
+
+Reported from a clean 63-clip batch: 11 clips came back with *"the clip ends at
+full volume — it may have been cut short"*, and every one of the eleven measured
+**−91 dB** over its final 0.25 s. Two clips from the same video with
+indistinguishable tails got different verdicts.
+
+The report's second hypothesis was right. `join_chunks` judged truncation on
+**the last chunk as the model made it**:
+
+```python
+# Truncation has to be judged on the LAST CHUNK AS THE MODEL MADE IT.
+info["ends_abruptly"] = ends_abruptly(parts[-1], sr)
+```
+
+The comment even argued the case: strip trailing silence and every clip ends in
+speech, so checking the joined audio would flag all of them. That reasoning
+overlooks what the same function does four lines later — it appends
+`tail_pad_sec` (300 ms) of silence. So the joined clip flags **none** of them,
+while the raw last chunk ends on speech whenever the model did not leave its
+own gap, which is common and is not a defect.
+
+Hence the exact pattern reported: fires on some clips and not others, for a
+reason that is invisible downstream, and never on anything actually wrong.
+
+## Fixed by measuring what the caller receives
+
+The verdict now comes from the delivered waveform — after joining, trimming,
+level matching, tail padding and loudness normalization. `join_chunks` still
+reports what it saw, under the honest name `last_chunk_ends_loud`, as a
+diagnostic that raises no warning.
+
+Measured on a regenerated ten-clip batch:
+
+| | before | after |
+|---|---|---|
+| clips carrying a warning | 4 | **0** |
+| tail level, last 0.25 s | — | **−200 dB on all ten** (pure silence) |
+| a clip deliberately cut mid-speech | — | **still warns** |
+
+That last row is the point: the check was corrected, not disabled. With
+`tail_pad_sec=0` a genuinely truncated clip still reads as truncated, and
+`tests/test_audio_fx.py` asserts both directions — a padded clip must not warn,
+an unpadded cut-off clip must.
+
+The old test is gone, because it encoded the flawed reasoning as an assertion.
+Its replacement says why.
+
+## The speaking-rate ceiling moved 1.30 → 1.40
+
+Three clips in that batch warned at 194, 195 and 204 wpm against a 147 wpm
+baseline — 1.32 to 1.39 — and all three were ordinary.
+
+The report suggested "±25 %", which would be **1.25 and tighter** than the 1.30
+that was already there; its own measurements are what argue for 1.40. The floor
+stays at 0.75: a voice slowing right down is a better signal of something wrong
+than one speeding up a little, and nothing measured argues for moving it.
+
+## One clip in the re-run was genuinely wrong, and that is reassuring
+
+The regenerated batch audited 9/10 clean. The tenth:
+
+```
+sent : the connecting service departs eleven minutes later
+heard: the connecting service passes  eleven minutes later
+```
+
+A real substitution by the model — upstream #253, which is open — and correctly
+**not** excused by any of the sound-alike work: the phonetic keys are `dprts`
+and `ps`. Worth recording, because the risk of relaxing a checker is that it
+starts waving through real defects, and here it did not.

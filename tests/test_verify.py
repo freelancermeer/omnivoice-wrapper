@@ -356,3 +356,23 @@ def test_sound_alike_matching_never_excuses_a_meaning_change():
     ]:
         d = verify.word_diff(sent, heard)
         assert not verify.clean(d), (sent, heard, d)
+
+
+# --- the speaking-rate band ----------------------------------------------
+# A clean 63-clip batch warned on 194, 195 and 204 wpm against a 147 wpm
+# baseline. All three were ordinary clips.
+
+def test_ordinary_rate_variation_does_not_warn():
+    for wpm in (194, 195, 204):
+        assert verify.rate_warning(wpm, 147.0) is None, wpm
+
+
+def test_a_real_rate_drift_still_warns():
+    assert verify.rate_warning(230, 147.0) is not None      # +56%
+    assert verify.rate_warning(95, 147.0) is not None       # -35%
+
+
+def test_a_voice_with_no_baseline_only_catches_catastrophes():
+    assert verify.rate_warning(204, None) is None
+    assert verify.rate_warning(310, None) is not None
+    assert verify.rate_warning(40, None) is not None

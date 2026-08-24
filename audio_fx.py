@@ -683,15 +683,18 @@ def join_chunks(parts: List[np.ndarray], sr: int, gap_sec: float = 0.15,
       through next cannot clip the final consonant.
     """
     info: Dict = {"chunks": len(parts), "level_corrections": [],
-                  "pad_sec": 0.0, "speech_sec": 0.0, "ends_abruptly": False}
+                  "pad_sec": 0.0, "speech_sec": 0.0, "last_chunk_ends_loud": False}
     if not parts:
         return np.zeros(0, dtype=np.float32), info
 
-    # Truncation has to be judged on the LAST CHUNK AS THE MODEL MADE IT.
-    # Once we have stripped its trailing silence, every clip ends in speech and
-    # the check would fire on all of them — a detector that flags every good
-    # clip is worse than no detector.
-    info["ends_abruptly"] = ends_abruptly(
+    # Diagnostic only — NOT the truncation warning. Whether the model's own
+    # last chunk happened to end on speech says nothing about the clip the
+    # caller receives, because this function goes on to add `tail_pad_sec` of
+    # silence to it. Judging truncation here produced a warning that was wrong
+    # every time it fired: 11 of 63 clips flagged, and all eleven measured
+    # -91 dB (digital silence) over their final 0.25 s. The warning is now
+    # raised against the delivered audio instead; see `_gen_core_impl`.
+    info["last_chunk_ends_loud"] = ends_abruptly(
         np.asarray(parts[-1], dtype=np.float32).reshape(-1), sr)
 
     cleaned = []

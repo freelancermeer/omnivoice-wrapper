@@ -1320,7 +1320,14 @@ def _gen_core_impl(
     rate_note = verify.rate_warning(measured_wpm, baseline_wpm)
     if rate_note:
         warnings.append(rate_note)
-    if join_info.get("ends_abruptly"):
+    # Judged on the audio the caller actually receives — after joining,
+    # trimming, level matching, tail padding and loudness normalization. The
+    # check used to run on the last chunk as the model made it, which is
+    # upstream of the 300 ms of silence this pipeline appends, so it flagged
+    # 11 of 63 clips that all measured -91 dB over their final 0.25 s. A
+    # warning that is wrong every time it fires teaches callers to ignore the
+    # header, which costs more than the check was ever worth.
+    if len(waveform_f) and audio_fx.ends_abruptly(waveform_f, sampling_rate):
         warnings.append("the clip ends at full volume — it may have been cut short")
 
     notes.append(f"{gen_time:.1f}s for {audio_dur:.1f}s audio · RTF {rtf:.3f}"
