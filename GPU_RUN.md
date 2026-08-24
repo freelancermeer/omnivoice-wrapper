@@ -971,3 +971,121 @@ That also corrects an earlier note in this document, which read Kernel-Power 41
 plus a cool GPU as marginal power delivery and suggested capping the card with
 `nvidia-smi -pl 150`. The cause is upstream of the PSU. **A UPS is the fix; the
 power cap would not have helped.**
+
+
+---
+
+# The request that returned nothing — it was a header, not a crash
+
+Reported as a native-level crash in torch, soundfile or CUDA: `/api/tts`
+accepted a request, worked for 26-41 s, then closed the connection with no
+status, no body and no header, every counter still at zero. Reproduced with
+`curl`, on all three voices, on a freshly restarted server with 3372 MB free.
+Always the same three segments of an eleven-segment video, never the other
+eight.
+
+It is none of those things. Running the server in the foreground and watching
+its own stderr — which the report correctly said was the only place the answer
+could be — printed this:
+
+```
+h11._util.LocalProtocolError: Illegal header value
+b"Hey everyone, James here. ... the properties Trump claimed "
+```
+
+## The whole cause, in one character
+
+`X-OmniVoice-Normalized-Text` carries the normalized script, truncated to 480
+characters. **Character 479 of that segment is a space**, and an HTTP header
+value may not begin or end with whitespace. h11 refuses to send it.
+
+That single fact explains every observation in the report:
+
+| observed | why |
+|---|---|
+| deterministic — the same 3 of 11 segments, every run | whether character 479 lands on a space is a property of the text, and nothing else |
+| a 164-word segment fails, a 330-word one succeeds | length is irrelevant; the truncation offset is what matters |
+| all three voices fail | the header is built from the script, which does not change with the voice |
+| both halves fail when split | each half's own 480th character also lands on a space |
+| `curl` reproduces it | it is a genuine protocol error, not a client library |
+| not a Python exception; `except BaseException` never fires | it is raised inside `send()`, after the route returned successfully — FastAPI is no longer in the call stack and cannot turn it into a 500 |
+| every counter reads zero | the generation *succeeded*; only the reply failed |
+| 26-41 s | that is the generation finishing, and then the response failing |
+
+The report's instinct that this was native was reasonable — nothing in Python
+normally kills a response after the route returns — but the traceback was
+sitting in stderr the whole time.
+
+## Fixed
+
+`_hdr()` now strips control characters, truncates, and **then** strips
+whitespace. The order matters: it is the truncation that creates the trailing
+space, so stripping first would not have helped.
+
+Verified on the reported reproducer, byte for byte:
+
+```
+HTTP 200   2,602,124 bytes   13.9 s   X-RTF: 0.253   X-RTF-Reason: normal
+```
+
+and across everything the report says also failed — three voices, two runs
+each, plus both 82-word halves: **8/8 succeeded**.
+
+`tests/test_headers.py` checks every truncation offset from 1 to 300 against
+h11's own field-value rule, so a value that cannot be sent can no longer be
+built. It needs no GPU.
+
+## And no request may end in silence
+
+Whatever the next such bug turns out to be, it should not be able to do this
+again. `_safe_headers()` validates every header value before the response is
+handed to uvicorn, repairs anything unsendable, logs it and counts it as
+`headers_sanitised`. By the time uvicorn validates, the audio has been
+generated and the status line is going out — a rejection there costs a whole
+request of GPU time to produce silence. The check belongs where the value can
+still be repaired.
+
+Generation failures also now log **what** was being generated: the first 200
+characters of the normalized text and the chunk count, so a chunk-boundary
+trigger shows itself on the first occurrence rather than after a five-run
+bisection.
+
+---
+
+# What one regeneration really costs
+
+The report found something the timing breakdown was hiding, and it was right.
+
+When a chunk is regenerated the whole clip is verified again, and that second
+pass was being counted as `verify_s`. Measured across 19 clips: clips with no
+regeneration verified in **0.31 s per chunk**, clips with one regenerated chunk
+in **1.07 s per chunk** — 3.5x, same voice, same settings, same batch. So the
+7.2 s attributed to regeneration was really about 53.6 s, and
+`regenerate_s: 1.4` understated it by roughly 8x.
+
+`timing` now separates them:
+
+```json
+"timing": {"generate_s": 24.3, "verify_s": 3.4,
+           "regenerate_s": 1.3, "reverify_s": 17.9}
+```
+
+A first pass and a second pass no longer look alike.
+
+# Homophones are not dropped words
+
+Every "defect" that batch's verifier found was the transcriber spelling the
+same sound its own way, and **not one genuinely dropped word in 19 clips**.
+Five of the seven reported pairs already passed. The two that did not:
+
+* **`allen` / `alan`** — 0.667 similarity, just under the 0.72 threshold, so it
+  counted as a real substitution. A crude phonetic key now catches it. The key
+  always keeps the first letter, so `million` and `billion` cannot collide
+  however similar the rest is.
+* **`lockup` / `lock up`** — one token against two. difflib called it a drop
+  plus two insertions; `same_spoken_form()` recognises that the characters are
+  identical and only the spacing moved.
+
+Guarded and tested: `ninety million` → `90 billion`, `not` → `now`,
+`nothing` → `something`, `first` → `third`, a dropped `dollars`, and the
+repeated-clause collapse are all still caught.

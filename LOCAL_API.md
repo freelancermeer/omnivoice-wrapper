@@ -450,11 +450,19 @@ X-RTF: 0.170      X-RTF-Reason: normal
              "verification took 49.6s against 36.4s of generation"]
 },
 "timing": {"normalize_s": 0.003, "generate_s": 36.411,
-           "verify_s": 49.643, "join_s": 0.066, "total_s": 86.818},
+           "verify_s": 3.4, "reverify_s": 46.2, "join_s": 0.066,
+           "total_s": 86.818},
 "chunks": {"total": 23, "regenerated": 2, "which": [14, 22],
            "regeneration_reasons": {"dropped_words": 2}, "regenerate_s": 3.329},
 "vram_at_start_mb": 3448.0
 ```
+
+`reverify_s` is separate from `verify_s` on purpose. A regenerated chunk causes
+the **whole clip** to be verified again, and folding that second pass into
+`verify_s` hides most of what a regeneration costs — measured across 19 clips,
+clips with one regenerated chunk verified 3.5x slower per chunk than clips with
+none, so a reported `regenerate_s: 1.4` was really closer to 11 s. A first pass
+and a second pass no longer look alike.
 
 The causes it will name: chunks regenerated (with the reason and which ones),
 verification outweighing generation, the card being short of memory when the

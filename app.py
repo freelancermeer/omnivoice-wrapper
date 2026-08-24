@@ -1217,7 +1217,16 @@ def _gen_core_impl(
                 chunks, parts, rep,
                 regen=lambda t: _generate([t], clone_prompt, instruct_val, 1)[0],
                 cancel_check=cancel_check)
-            timing["verify_s"] = round(time.perf_counter() - _t, 3)
+            # A regeneration re-reads the whole clip, and folding that second
+            # pass into "verify" hides most of what a regeneration costs: on a
+            # measured batch, clips with one regenerated chunk verified 3.5x
+            # slower than clips with none (1.07s vs 0.31s per chunk), so the
+            # 7.2s attributed to regeneration was really closer to 53.6s.
+            total_verify = time.perf_counter() - _t
+            reverify = float(rep.pop("_reverify_s", 0.0))
+            timing["verify_s"] = round(max(total_verify - reverify, 0.0), 3)
+            if reverify:
+                timing["reverify_s"] = round(reverify, 3)
 
         _t = time.perf_counter()
         waveform_f, join_info = audio_fx.join_chunks(
@@ -1228,7 +1237,13 @@ def _gen_core_impl(
     except _Cancelled:
         return None, "Cancelled"
     except Exception as e:
-        log.exception("generation failed")
+        # What it was working on, not just that it failed. If a particular
+        # chunk boundary is the trigger, this shows it on the first occurrence
+        # instead of after a five-run bisection.
+        log.exception("generation failed on %d chunk(s); normalized text began: %r",
+                      len(chunks), (syn_text or "")[:200])
+        rep["failed_text_head"] = (syn_text or "")[:200]
+        rep["failed_chunks"] = len(chunks)
         return None, f"Error: {type(e).__name__}: {e}"
     finally:
         gpu_guard.free_cuda()
@@ -1457,10 +1472,14 @@ def _verify_and_repair(chunks, parts, rep, regen, cancel_check=None):
             finally:
                 rep["regen_sec"] = round(
                     rep.get("regen_sec", 0.0) + (time.perf_counter() - _t_regen), 3)
+            _t_rv = time.perf_counter()
             try:
                 heard2 = _transcribe_audio(candidate, sampling_rate)
             except Exception:  # noqa: BLE001
                 break
+            finally:
+                rep["_reverify_s"] = (rep.get("_reverify_s", 0.0)
+                                      + (time.perf_counter() - _t_rv))
             diff2 = verify.word_diff(chunk, heard2)
             better = (len(diff2["missing"]) + len(diff2["extra"])
                       < len(diff["missing"]) + len(diff["extra"]))
@@ -2833,11 +2852,52 @@ def _idem_drop(key: Optional[str]):
 
 def _hdr(value: Any, limit: int = 480) -> str:
     """HTTP headers are latin-1; a script is not. Never let a header kill a
-    response that is otherwise fine."""
+    response that is otherwise fine.
+
+    The truncation is where this went wrong. Cutting the normalized script at
+    480 characters lands on a space often enough, and a header value may not
+    begin or end with whitespace — h11 rejects it, and it rejects it *after*
+    the route has already returned, inside `send()`, where FastAPI can no
+    longer turn it into a 500. The caller gets a closed connection with no
+    status, no body and nothing in any counter, 26-41 s after asking.
+
+    Measured on the reported reproducer: character 479 of that segment is a
+    space, and the same three segments of an eleven-segment video failed every
+    run while the other eight never did. Not the model, not VRAM, not the text
+    length — the offset the truncation happened to land on.
+
+    So: control characters out, then truncate, then strip. The strip is last
+    because it is the truncation that creates the trailing space.
+    """
     s = str(value if value is not None else "")
-    s = s.replace("\n", " ").replace("\r", " ")
     s = s.encode("ascii", "replace").decode("ascii")
-    return s[:limit]
+    # Anything h11 will not accept in a field value, including the tab and
+    # newline family, becomes a plain space.
+    s = "".join(ch if 0x20 <= ord(ch) < 0x7F else " " for ch in s)
+    return s[:limit].strip()
+
+
+def _safe_headers(h: Dict[str, Any]) -> Dict[str, str]:
+    """Last line of defence: no header may be able to kill a finished response.
+
+    By the time uvicorn validates headers the route has returned, the audio has
+    been generated and the status line is already going out — a rejection there
+    closes the connection with nothing in it and no way for FastAPI to report
+    it. That is a whole request of GPU time spent to produce silence, so the
+    check belongs here, before the response is handed over, where a bad value
+    can still be repaired instead of being fatal.
+
+    Every request ends as a counted success or a counted failure. Vanishing is
+    not a third option.
+    """
+    out: Dict[str, str] = {}
+    for k, v in (h or {}).items():
+        cleaned = _hdr(v)
+        if cleaned != (str(v) if v is not None else ""):
+            _bump("headers_sanitised")
+            log.warning("header %s was not sendable as-is and was cleaned", k)
+        out[str(k)] = cleaned
+    return out
 
 
 def _queue_depth() -> int:
@@ -3076,7 +3136,7 @@ def _build_api():
         }
         if rep.get("warnings"):
             h["X-OmniVoice-Warning"] = _hdr("; ".join(rep["warnings"]))
-        return h
+        return _safe_headers(h)
 
     def _meta(rep, project, ext, sr, wav, voice_id, ref_used, mode):
         return {

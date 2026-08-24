@@ -315,3 +315,44 @@ def test_stemming_needs_a_word_left_over():
     assert verify._stem("as") == "as"
     assert verify._stem("memories") == "memory"
     assert verify._stem("reports") == "report"
+
+
+# --- the transcriber's spelling is not the model's mistake ----------------
+# From a 19-clip batch: every "defect" the verifier found was one of these,
+# and not one genuinely dropped word among them. Each was buying a full
+# regeneration plus a re-verification of the whole clip.
+
+def test_reported_spelling_pairs_are_not_defects():
+    for sent, heard in [
+        ("advisers", "advisors"), ("organization", "organisation"),
+        ("seventies", "seventys"), ("behavior", "behaviour"),
+        ("allen", "alan"), ("client", "clients"), ("claimed", "claim"),
+    ]:
+        assert verify.likely_asr_artifact(sent, heard), (sent, heard)
+
+
+def test_a_spacing_difference_is_not_a_dropped_word():
+    """"lockup" against "lock up": one token against two, same sound."""
+    d = verify.word_diff("the lockup was ordered", "the lock up was ordered")
+    assert verify.clean(d), d
+    assert not verify.worth_regenerating(d)
+
+
+def test_the_phonetic_key_keeps_the_first_letter():
+    """So no amount of similarity can collide million with billion."""
+    assert verify._phonetic_key("allen") == verify._phonetic_key("alan")
+    assert verify._phonetic_key("million") != verify._phonetic_key("billion")
+    assert verify._phonetic_key("") == ""
+
+
+def test_sound_alike_matching_never_excuses_a_meaning_change():
+    for sent, heard in [
+        ("he owes ninety million", "he owes 90 billion"),
+        ("it is not official", "it is now official"),
+        ("nothing was found", "something was found"),
+        ("the first attempt", "the third attempt"),
+        ("one hundred dollars", "one hundred"),
+        ("twenty senators voted", "senators voted"),
+    ]:
+        d = verify.word_diff(sent, heard)
+        assert not verify.clean(d), (sent, heard, d)

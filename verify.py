@@ -63,6 +63,41 @@ def _stem(word: str) -> str:
     return word
 
 
+_PHONETIC_MAP = str.maketrans({"k": "c", "q": "c", "z": "s", "j": "g",
+                               "y": "i", "w": "u", "v": "f"})
+
+
+def _phonetic_key(word: str) -> str:
+    """A crude sound-alike key: same sound, different spelling, same key.
+
+    Deliberately crude. It exists for one job — a proper noun the transcriber
+    spelled its own way, like "allen" against "alan", which scores 0.667 on raw
+    similarity and so counted as a real substitution and bought a full
+    re-generation that could not fix it. The first letter is always kept, so
+    "million" and "billion" cannot collide however similar the rest is.
+    """
+    w = "".join(ch for ch in word.lower() if ch.isalpha())
+    if not w:
+        return ""
+    head, rest = w[0], w[1:].translate(_PHONETIC_MAP)
+    rest = "".join(ch for ch in rest if ch not in "aeiouh")
+    out = [head]
+    for ch in rest:                       # collapse doubles
+        if not out or ch != out[-1]:
+            out.append(ch)
+    return "".join(out)
+
+
+def same_spoken_form(a: List[str], b: List[str]) -> bool:
+    """Is this only a difference of spacing? "lockup" against "lock up".
+
+    difflib sees one token against two and calls it a drop plus two
+    insertions. The audio said one thing; the transcriber chose where to put
+    the gap.
+    """
+    return bool(a and b and "".join(a) == "".join(b))
+
+
 def likely_asr_artifact(sent_word: str, heard_word: str,
                         threshold: float = None) -> bool:
     """Is this substitution the transcriber, or the model?
@@ -85,7 +120,11 @@ def likely_asr_artifact(sent_word: str, heard_word: str,
     if _stem(sent_word) == _stem(heard_word):
         return True
     thr = ASR_SIMILARITY if threshold is None else threshold
-    return difflib.SequenceMatcher(None, sent_word, heard_word).ratio() >= thr
+    if difflib.SequenceMatcher(None, sent_word, heard_word).ratio() >= thr:
+        return True
+    # Last resort, for names the transcriber spelled its own way.
+    key = _phonetic_key(sent_word)
+    return bool(key) and key == _phonetic_key(heard_word)
 
 _CLEAN_RE = re.compile(r"[^a-z0-9' ]")
 
@@ -169,8 +208,12 @@ def _word_diff_once(sent_text: str, spoken_text: str) -> Dict:
             extra += spoken[j1:j2]
         elif op == "replace":
             a, b = sent[i1:i2], spoken[j1:j2]
-            if len(a) == len(b) and all(likely_asr_artifact(x, y)
-                                        for x, y in zip(a, b)):
+            if same_spoken_form(a, b):
+                # "lockup" against "lock up": the same sound, spaced
+                # differently. Nothing was dropped and nothing was added.
+                misheard.append((" ".join(a), " ".join(b)))
+            elif len(a) == len(b) and all(likely_asr_artifact(x, y)
+                                          for x, y in zip(a, b)):
                 misheard += list(zip(a, b))
             else:
                 missing += a
