@@ -395,6 +395,14 @@ against a second, unrelated transcriber (`tools/verify_external.py`): on ten
 clips, the built-in verifier called 10/10 clean and AssemblyAI 9/10, agreeing
 on 9/10 — the single disagreement being AssemblyAI's own mistake.
 
+**Should you turn it off?** Measured both ways on the same batch: 27 s checked
+against 20 s unchecked, and long-form RTF 0.170 against 0.151. The difference
+that matters is not detection — `tools/audit_batch.py` finds the same defects
+afterwards — but **repair**: with checking on, a chunk that came out wrong is
+regenerated during the run and the caller never sees it. With it off you learn
+which clips are bad and re-render them yourself. On this server the recommended
+setting is **on**.
+
 Turn checking off with `OMNIVOICE_VERIFY=0` if you would rather audit the whole
 batch afterwards with `tools/audit_batch.py`; responses then carry
 `X-Verified: false`.
@@ -413,6 +421,7 @@ set OMNIVOICE_MAX_CONCURRENCY=1       REM 1 on an 8 GB card
 set OMNIVOICE_VERIFY=0                REM ship without checking (see 5b)
 set OMNIVOICE_ASR_BATCH=12            REM verifier windows read at once
 set OMNIVOICE_ASR_DEVICE=cpu          REM move Whisper off the GPU entirely
+set OMNIVOICE_ASR_BACKEND=faster      REM CTranslate2 verifier: -1.6 GB VRAM
 ```
 
 `OMNIVOICE_ASR_BATCH` is the one worth knowing about. The verifier reads its

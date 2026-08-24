@@ -181,6 +181,8 @@ time actually goes, and what each lever costs:
 | **`OMNIVOICE_ASR_BATCH`** | now `12`. The verifier reads its 30 s windows as one batch instead of one after another — long-form RTF **0.221 → 0.170**, transcripts identical (word accuracy 1.0000) | ~800 MB of VRAM. `16` buys nothing further (0.169) for another 811 MB |
 | *(automatic)* | clock times and inferred currency symbols in the transcript no longer count as errors, so they no longer buy a re-generation — one clip went **0.548 → 0.244** | none; both readings are scored and only a better match is accepted |
 | **close Parsec** | not a code lever, but the largest one on the reference box: Parsec takes **~25 % of the GPU** continuously (desktop capture + NVENC) | you lose remote access to the machine while it is closed |
+| `OMNIVOICE_ASR_BACKEND=faster` | verifier reads through CTranslate2 instead of transformers. Speed is a wash, but OmniVoice's own Whisper is never loaded: **3529 MB → 1953 MB** | `pip install faster-whisper` |
+| `OMNIVOICE_COMPILE=1` | **do not.** Measured at **2x slower** (RTF 0.342 against 0.170) — an autoregressive model recompiles on every new sequence length and never amortises it | — |
 
 Measured on this machine, the CPU-side audio work is **not** where the time
 goes — on a 60 s clip: loudness normalization 126 ms, chunk joining 6 ms,

@@ -161,3 +161,17 @@ setuptools==70.2.0
 #   venv\Scripts\python -m pip install pytest requests
 # pytest==8.4.2
 # requests is already pinned above (2.34.2)
+
+# ---- OPTIONAL: a faster runtime for the verifier's transcriber ----
+# Same Whisper weights through CTranslate2. End-to-end speed is a wash (the
+# verifier's windows are already batched), but OmniVoice's own Whisper is then
+# never loaded at all: 3529 MB -> 1953 MB of VRAM, which matters on 8 GB.
+#   pip install faster-whisper
+# Then: set OMNIVOICE_ASR_BACKEND=faster
+# faster-whisper==1.2.1
+
+# ---- DO NOT: torch.compile ----
+# OMNIVOICE_COMPILE=1 needs Triton, which has no official Windows build. With
+# the unofficial triton-windows==3.4.0.post21 it runs, and it is 2x SLOWER
+# (RTF 0.342 against 0.170): an autoregressive model recompiles on every new
+# sequence length and never amortises it. Measured, not assumed.

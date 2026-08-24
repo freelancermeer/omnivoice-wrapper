@@ -789,3 +789,63 @@ in the verifier:
 The third is a real option and an honest one — the batch audit catches the same
 defects, just after the run instead of during it. It is a decision about when
 you want to find out, not whether.
+
+
+---
+
+## The last speed lever: torch.compile, measured, and it is a loss
+
+With FlashInfer ruled out and the verifier already at ~40x realtime, the only
+remaining target was generation itself — the 0.151 that the 0.170 is mostly
+made of. `OMNIVOICE_COMPILE` has been in the code since the beginning and had
+never been run.
+
+It does not work on Windows out of the box: `torch.compile` needs Triton, and
+`TritonMissing` is what it raises. There is an unofficial Windows build, and
+version-matched to torch 2.8 (`triton-windows==3.4.0.post21`) it does work —
+so this is a real measurement rather than another Linux-only wall.
+
+Same 203 s script, same voice, four runs:
+
+| run | wall | RTF |
+|---|---:|---:|
+| 1 (compile warmup) | 124.7 s | 0.610 |
+| 2 | 74.4 s | 0.363 |
+| 3 | 74.1 s | 0.365 |
+| 4 | 70.5 s | 0.342 |
+| **uncompiled, for comparison** | **35 s** | **0.168–0.170** |
+
+**Twice as slow, and it stays that way after warmup.** The cause is the classic
+one for autoregressive models without a static KV cache: every new sequence
+length is a new shape, and every new shape is a recompile. A TTS server sees a
+different length on essentially every clip, so it pays compilation constantly
+and never amortises it.
+
+`triton-windows` was uninstalled afterwards — an unofficial package that only
+enables a feature measured to hurt is a liability in something being sold.
+`OMNIVOICE_COMPILE` stays at its default of `0`. Reproduce with
+`pip install triton-windows==3.4.0.post21` and `set OMNIVOICE_COMPILE=1`.
+
+## Where RTF finally stands, and why
+
+```
+RTF 0.170  =  0.151 generation  +  0.019 verification
+```
+
+Everything tried against each half, and what happened:
+
+| target | attempt | result |
+|---|---|---|
+| verification | batch the ASR windows | **0.300 → 0.226** ✅ |
+| verification | raise batch 8 → 12 | **0.226 → 0.170** ✅ |
+| verification | stop false-alarm regenerations | one clip **0.548 → 0.244** ✅ |
+| verification | faster-whisper runtime | no change; **−1.6 GB VRAM** ✅ |
+| verification | overlap with generation | rejected — both GPU-bound, no time to hide |
+| generation | FlashInfer | impossible on Windows (NCCL) |
+| generation | torch.compile | **2x slower** — recompiles per length |
+| whole GPU | close Parsec | ~25 % available, declined (remote access) |
+
+The verification half went from ~100 % overhead this morning to **12.6 %**. The
+generation half is, on this hardware and this OS, where it is. The remaining
+0.151 is OmniVoice in eager PyTorch on an Ampere card, and every documented way
+past it needs Linux.
