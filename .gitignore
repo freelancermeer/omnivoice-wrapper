@@ -84,3 +84,7 @@ nov_audit.json
 
 tr.json
 tr_audit.json
+
+# Colab notebook carries a live HF token - never publish it (this repo is public)
+OmniVoice_Colab.ipynb
+requirements.colab.txt
